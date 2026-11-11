@@ -349,6 +349,28 @@ pub fn add_header(m: SipMessage, name: Str, value: Str, first: Bool) -> SipMessa
     SipMessage { is_request: m.is_request, method: m.method, uri: m.uri, status: m.status, reason: m.reason,
                  version: m.version, headers: hs, body: m.body }
 
+// A copy of the message with the first Via header replaced by `value`.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.request("X", "sip:a@b", [sipmsg.header_of("Via", "SIP/2.0/UDP a"), sipmsg.header_of("Via", "SIP/2.0/UDP b")], bytes.from_str(""))
+//     println(sipmsg.header_values(sipmsg.set_first_via(m, "SIP/2.0/UDP z"), "Via")[0])   // SIP/2.0/UDP z
+// ```
+pub fn set_first_via(m: SipMessage, value: Str) -> SipMessage
+    var hs: [SipHeader] = []
+    var done = false
+    for h in m.headers
+        if h.name == "Via" and not done
+            list.push(hs, SipHeader { name: "Via", value: value })
+            done = true
+        else
+            list.push(hs, h)
+    SipMessage { is_request: m.is_request, method: m.method, uri: m.uri, status: m.status, reason: m.reason,
+                 version: m.version, headers: hs, body: m.body }
+
 // A copy of the message with another body, and a Content-Length that agrees.
 //
 // ```novo
@@ -361,8 +383,8 @@ pub fn add_header(m: SipMessage, name: Str, value: Str, first: Bool) -> SipMessa
 //     println("${sipmsg.header_value(n, "Content-Length") ?? "-"} ${sipmsg.header_value(n, "Content-Type") ?? "-"}")   // 3 application/sdp
 // ```
 pub fn with_body(m: SipMessage, content_type: Str, body: Bytes) -> SipMessage
-    let withlen = set_header(m, "Content-Length", str.from_int(bytes.len(body)))
-    let typed = set_header(withlen, "Content-Type", content_type)
+    let typed0 = set_header(m, "Content-Type", content_type)
+    let typed = set_header(typed0, "Content-Length", str.from_int(bytes.len(body)))
     SipMessage { is_request: typed.is_request, method: typed.method, uri: typed.uri, status: typed.status,
                  reason: typed.reason, version: typed.version, headers: typed.headers, body: body }
 
@@ -663,6 +685,79 @@ pub fn via_branch(v: SipVia) -> Str
 // ```
 pub fn branch_is_rfc3261(branch: Str) -> Bool
     str.starts_with(branch, SIP_MAGIC) and str.len(branch) > str.len(SIP_MAGIC)
+
+// A Via with the `rport` parameter added when it has none (RFC 3581 section 3):
+// it asks the server to answer to the port the request came from.
+//
+// ```novo
+// use sipmsg
+//
+// fn main() [io]
+//     println(sipmsg.write_via(sipmsg.with_rport(sipmsg.new_via("UDP", "h", 5060, "z9hG4bKa"))))   // SIP/2.0/UDP h:5060;branch=z9hG4bKa;rport
+// ```
+pub fn with_rport(v: SipVia) -> SipVia
+    if sipuri.has_param(v.params, "rport")
+        return v
+    var ps: [sipuri.SipParam] = []
+    for p in v.params
+        list.push(ps, p)
+    list.push(ps, sipuri.flag("rport"))
+    SipVia { protocol: v.protocol, transport: v.transport, host: v.host, port: v.port, params: ps }
+
+// The Via a server writes into its response for a request that came from
+// `source_host` and `source_port`: `received` is added when the sent-by host
+// is not the source (RFC 3261 section 18.2.1), and an `rport` that has no value
+// gets the source port (RFC 3581 section 4).
+//
+// ```novo
+// use sipmsg
+//
+// fn main() [io]
+//     let v = sipmsg.with_rport(sipmsg.new_via("UDP", "pc33.example", -1, "z9hG4bKa"))
+//     println(sipmsg.write_via(sipmsg.mark_received(v, "192.0.2.1", 5062)))   // SIP/2.0/UDP pc33.example;branch=z9hG4bKa;rport=5062;received=192.0.2.1
+// ```
+pub fn mark_received(v: SipVia, source_host: Str, source_port: Int) -> SipVia
+    var ps: [sipuri.SipParam] = []
+    for p in v.params
+        if sipstr.eq_ci(p.name, "rport") and not p.has_value
+            list.push(ps, sipuri.param("rport", str.from_int(source_port)))
+        elif not sipstr.eq_ci(p.name, "received")
+            list.push(ps, p)
+    if str.lower(v.host) != str.lower(source_host)
+        list.push(ps, sipuri.param("received", source_host))
+    SipVia { protocol: v.protocol, transport: v.transport, host: v.host, port: v.port, params: ps }
+
+// The host a response to a request with this Via is sent to: `received` when
+// there is one, otherwise the sent-by host (RFC 3261 section 18.2.2).
+//
+// ```novo
+// use sipmsg
+//
+// fn main() [io]
+//     let v = sipmsg.parse_via("SIP/2.0/UDP h;received=192.0.2.1")!
+//     println(sipmsg.reply_host(v))   // 192.0.2.1
+// ```
+pub fn reply_host(v: SipVia) -> Str
+    sipuri.find_param(v.params, "received") ?? v.host
+
+// The port a response is sent to: a numeric `rport`, otherwise the sent-by
+// port, otherwise 5060 (5061 for TLS).
+//
+// ```novo
+// use sipmsg
+//
+// fn main() [io]
+//     println("${sipmsg.reply_port(sipmsg.parse_via("SIP/2.0/UDP h:5060;rport=5062")!)} ${sipmsg.reply_port(sipmsg.parse_via("SIP/2.0/TLS h")!)}")   // 5062 5061
+// ```
+pub fn reply_port(v: SipVia) -> Int
+    let rp = sipstr.number(sipuri.find_param(v.params, "rport") ?? "")
+    if rp >= 0
+        return rp
+    if v.port >= 0
+        return v.port
+    if v.transport == "TLS"
+        return 5061
+    5060
 
 // The Via headers of a message, in order, each read.  A Via that cannot be
 // read ends the list.

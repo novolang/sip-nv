@@ -240,7 +240,7 @@ fn parse_sip(t: Str, scheme: Str, rest: Str) -> Result<SipUri, SipError>
     let pieces = str.split(hostpart, ";")
     let hp = pieces[0]
     let he = host_end(hp)
-    if he < 1
+    if he < 1 or (str.starts_with(hp, "[") and he < 3)
         return Err(SipBadUri(t))
     let host = str.slice(hp, 0, he)
     var port = -1

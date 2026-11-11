@@ -1,0 +1,195 @@
+// tests/sip3261_tests.nv — the example session of RFC 3261 section 24.2.
+//
+// Alice at `pc33.atlanta.com` calls Bob at `biloxi.com` through two proxies and
+// Bob hangs up; the RFC gives the fourteen messages F1 to F14.  They are
+// copied here from the RFC's text, with the two places where it writes
+// "(Alice's SDP not shown)" and "(Bob's SDP not shown)" filled in with a
+// session description of the same shape and the Content-Length changed to its
+// length.  The tests read every message, check that the transaction layer
+// matches the ones it should, and form the requests of both ends again from
+// the dialog and compare them with F12 and F13.
+
+use std.bytes
+use std.str
+use std.test
+use sipbuild
+use sipdialog
+use sipmsg
+use siptxn
+
+fn m(text: Str) -> SipMessage
+    sipmsg.parse(bytes.from_str(text))!
+
+fn ok(x: SipMessage) -> Bool
+    match sipmsg.validate(x)
+        Ok(_)  => true
+        Err(_) => false
+
+fn f1() -> Str
+    "INVITE sip:bob@biloxi.com SIP/2.0\r\nVia: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bKnashds8\r\nMax-Forwards: 70\r\nTo: Bob <sip:bob@biloxi.com>\r\nFrom: Alice <sip:alice@atlanta.com>;tag=1928301774\r\nCall-ID: a84b4c76e66710\r\nCSeq: 314159 INVITE\r\nContact: <sip:alice@pc33.atlanta.com>\r\nContent-Type: application/sdp\r\nContent-Length: 156\r\n\r\nv=0\r\no=alice 2890844526 2890844526 IN IP4 pc33.atlanta.com\r\ns=Session SDP\r\nc=IN IP4 pc33.atlanta.com\r\nt=0 0\r\nm=audio 49172 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+
+fn f2() -> Str
+    "SIP/2.0 100 Trying\r\nVia: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bKnashds8\r\n ;received=192.0.2.1\r\nTo: Bob <sip:bob@biloxi.com>\r\nFrom: Alice <sip:alice@atlanta.com>;tag=1928301774\r\nCall-ID: a84b4c76e66710\r\nCSeq: 314159 INVITE\r\nContent-Length: 0\r\n\r\n"
+
+fn f3() -> Str
+    "INVITE sip:bob@biloxi.com SIP/2.0\r\nVia: SIP/2.0/UDP bigbox3.site3.atlanta.com;branch=z9hG4bK77ef4c2312983.1\r\nVia: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bKnashds8\r\n ;received=192.0.2.1\r\nMax-Forwards: 69\r\nTo: Bob <sip:bob@biloxi.com>\r\nFrom: Alice <sip:alice@atlanta.com>;tag=1928301774\r\nCall-ID: a84b4c76e66710\r\nCSeq: 314159 INVITE\r\nContact: <sip:alice@pc33.atlanta.com>\r\nContent-Type: application/sdp\r\nContent-Length: 156\r\n\r\nv=0\r\no=alice 2890844526 2890844526 IN IP4 pc33.atlanta.com\r\ns=Session SDP\r\nc=IN IP4 pc33.atlanta.com\r\nt=0 0\r\nm=audio 49172 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+
+fn f4() -> Str
+    "SIP/2.0 100 Trying\r\nVia: SIP/2.0/UDP bigbox3.site3.atlanta.com;branch=z9hG4bK77ef4c2312983.1\r\n ;received=192.0.2.2\r\nVia: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bKnashds8\r\n ;received=192.0.2.1\r\nTo: Bob <sip:bob@biloxi.com>\r\nFrom: Alice <sip:alice@atlanta.com>;tag=1928301774\r\nCall-ID: a84b4c76e66710\r\nCSeq: 314159 INVITE\r\nContent-Length: 0\r\n\r\n"
+
+fn f5() -> Str
+    "INVITE sip:bob@192.0.2.4 SIP/2.0\r\nVia: SIP/2.0/UDP server10.biloxi.com;branch=z9hG4bK4b43c2ff8.1\r\nVia: SIP/2.0/UDP bigbox3.site3.atlanta.com;branch=z9hG4bK77ef4c2312983.1\r\n ;received=192.0.2.2\r\nVia: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bKnashds8\r\n ;received=192.0.2.1\r\nMax-Forwards: 68\r\nTo: Bob <sip:bob@biloxi.com>\r\nFrom: Alice <sip:alice@atlanta.com>;tag=1928301774\r\nCall-ID: a84b4c76e66710\r\nCSeq: 314159 INVITE\r\nContact: <sip:alice@pc33.atlanta.com>\r\nContent-Type: application/sdp\r\nContent-Length: 156\r\n\r\nv=0\r\no=alice 2890844526 2890844526 IN IP4 pc33.atlanta.com\r\ns=Session SDP\r\nc=IN IP4 pc33.atlanta.com\r\nt=0 0\r\nm=audio 49172 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+
+fn f6() -> Str
+    "SIP/2.0 180 Ringing\r\nVia: SIP/2.0/UDP server10.biloxi.com;branch=z9hG4bK4b43c2ff8.1\r\n ;received=192.0.2.3\r\nVia: SIP/2.0/UDP bigbox3.site3.atlanta.com;branch=z9hG4bK77ef4c2312983.1\r\n ;received=192.0.2.2\r\nVia: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bKnashds8\r\n ;received=192.0.2.1\r\nTo: Bob <sip:bob@biloxi.com>;tag=a6c85cf\r\nFrom: Alice <sip:alice@atlanta.com>;tag=1928301774\r\nCall-ID: a84b4c76e66710\r\nContact: <sip:bob@192.0.2.4>\r\nCSeq: 314159 INVITE\r\nContent-Length: 0\r\n\r\n"
+
+fn f7() -> Str
+    "SIP/2.0 180 Ringing\r\nVia: SIP/2.0/UDP bigbox3.site3.atlanta.com;branch=z9hG4bK77ef4c2312983.1\r\n ;received=192.0.2.2\r\nVia: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bKnashds8\r\n ;received=192.0.2.1\r\nTo: Bob <sip:bob@biloxi.com>;tag=a6c85cf\r\nFrom: Alice <sip:alice@atlanta.com>;tag=1928301774\r\nCall-ID: a84b4c76e66710\r\nContact: <sip:bob@192.0.2.4>\r\nCSeq: 314159 INVITE\r\nContent-Length: 0\r\n\r\n"
+
+fn f8() -> Str
+    "SIP/2.0 180 Ringing\r\nVia: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bKnashds8\r\n ;received=192.0.2.1\r\nTo: Bob <sip:bob@biloxi.com>;tag=a6c85cf\r\nFrom: Alice <sip:alice@atlanta.com>;tag=1928301774\r\nCall-ID: a84b4c76e66710\r\nContact: <sip:bob@192.0.2.4>\r\nCSeq: 314159 INVITE\r\nContent-Length: 0\r\n\r\n"
+
+fn f9() -> Str
+    "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP server10.biloxi.com;branch=z9hG4bK4b43c2ff8.1\r\n ;received=192.0.2.3\r\nVia: SIP/2.0/UDP bigbox3.site3.atlanta.com;branch=z9hG4bK77ef4c2312983.1\r\n ;received=192.0.2.2\r\nVia: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bKnashds8\r\n ;received=192.0.2.1\r\nTo: Bob <sip:bob@biloxi.com>;tag=a6c85cf\r\nFrom: Alice <sip:alice@atlanta.com>;tag=1928301774\r\nCall-ID: a84b4c76e66710\r\nCSeq: 314159 INVITE\r\nContact: <sip:bob@192.0.2.4>\r\nContent-Type: application/sdp\r\nContent-Length: 139\r\n\r\nv=0\r\no=bob 2808844564 2808844564 IN IP4 192.0.2.4\r\ns=Session SDP\r\nc=IN IP4 192.0.2.4\r\nt=0 0\r\nm=audio 3456 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+
+fn f10() -> Str
+    "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP bigbox3.site3.atlanta.com;branch=z9hG4bK77ef4c2312983.1\r\n ;received=192.0.2.2\r\nVia: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bKnashds8\r\n ;received=192.0.2.1\r\nTo: Bob <sip:bob@biloxi.com>;tag=a6c85cf\r\nFrom: Alice <sip:alice@atlanta.com>;tag=1928301774\r\nCall-ID: a84b4c76e66710\r\nCSeq: 314159 INVITE\r\nContact: <sip:bob@192.0.2.4>\r\nContent-Type: application/sdp\r\nContent-Length: 139\r\n\r\nv=0\r\no=bob 2808844564 2808844564 IN IP4 192.0.2.4\r\ns=Session SDP\r\nc=IN IP4 192.0.2.4\r\nt=0 0\r\nm=audio 3456 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+
+fn f11() -> Str
+    "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bKnashds8\r\n ;received=192.0.2.1\r\nTo: Bob <sip:bob@biloxi.com>;tag=a6c85cf\r\nFrom: Alice <sip:alice@atlanta.com>;tag=1928301774\r\nCall-ID: a84b4c76e66710\r\nCSeq: 314159 INVITE\r\nContact: <sip:bob@192.0.2.4>\r\nContent-Type: application/sdp\r\nContent-Length: 139\r\n\r\nv=0\r\no=bob 2808844564 2808844564 IN IP4 192.0.2.4\r\ns=Session SDP\r\nc=IN IP4 192.0.2.4\r\nt=0 0\r\nm=audio 3456 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+
+fn f12() -> Str
+    "ACK sip:bob@192.0.2.4 SIP/2.0\r\nVia: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bKnashds9\r\nMax-Forwards: 70\r\nTo: Bob <sip:bob@biloxi.com>;tag=a6c85cf\r\nFrom: Alice <sip:alice@atlanta.com>;tag=1928301774\r\nCall-ID: a84b4c76e66710\r\nCSeq: 314159 ACK\r\nContent-Length: 0\r\n\r\n"
+
+fn f13() -> Str
+    "BYE sip:alice@pc33.atlanta.com SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.4;branch=z9hG4bKnashds10\r\nMax-Forwards: 70\r\nFrom: Bob <sip:bob@biloxi.com>;tag=a6c85cf\r\nTo: Alice <sip:alice@atlanta.com>;tag=1928301774\r\nCall-ID: a84b4c76e66710\r\nCSeq: 231 BYE\r\nContent-Length: 0\r\n\r\n"
+
+fn f14() -> Str
+    "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 192.0.2.4;branch=z9hG4bKnashds10\r\nFrom: Bob <sip:bob@biloxi.com>;tag=a6c85cf\r\nTo: Alice <sip:alice@atlanta.com>;tag=1928301774\r\nCall-ID: a84b4c76e66710\r\nCSeq: 231 BYE\r\nContent-Length: 0\r\n\r\n"
+
+@test
+fn every_message_of_the_example_is_read_and_valid()
+    for t in [f1(), f2(), f3(), f4(), f5(), f6(), f7(), f8(), f9(), f10(), f11(), f12(), f13(), f14()]
+        let x = m(t)
+        test.assert(ok(x))
+        // And written back it reads the same.
+        let y = sipmsg.parse(sipmsg.write(x))!
+        test.assert_eq(y.method, x.method)
+        test.assert_eq(y.status, x.status)
+        test.assert_eq(list.len(y.headers), list.len(x.headers))
+        test.assert_eq(bytes.len(y.body), bytes.len(x.body))
+
+@test
+fn the_proxies_stack_vias_and_the_branch_picks_the_transaction()
+    test.assert_eq(list.len(sipmsg.via_list(m(f1()))), 1)
+    test.assert_eq(list.len(sipmsg.via_list(m(f3()))), 2)
+    test.assert_eq(list.len(sipmsg.via_list(m(f5()))), 3)
+    test.assert_eq(sipmsg.via_branch(sipmsg.via_list(m(f5()))[0]), "z9hG4bK4b43c2ff8.1")
+    test.assert_eq(sipuri_param(sipmsg.via_list(m(f2()))[0]), "192.0.2.1")
+    // Alice's client transaction for F1 takes F2, F8 and F11 and no other.
+    let t = siptxn.client_new(m(f1()), false)
+    test.assert_eq(t.key, "z9hG4bKnashds8|INVITE")
+    test.assert_eq(siptxn.matches_response(t, m(f2())), true)
+    test.assert_eq(siptxn.matches_response(t, m(f8())), true)
+    test.assert_eq(siptxn.matches_response(t, m(f11())), true)
+    test.assert_eq(siptxn.matches_response(t, m(f14())), false)
+    // The atlanta proxy's client transaction for F3 takes F4 and F7.
+    let p = siptxn.client_new(m(f3()), false)
+    test.assert_eq(siptxn.matches_response(p, m(f4())), true)
+    test.assert_eq(siptxn.matches_response(p, m(f7())), true)
+    test.assert_eq(siptxn.matches_response(p, m(f2())), false)
+    // Bob's server transaction for F5 takes the same request again, and not F3.
+    let s = siptxn.server_new(m(f5()), false)
+    test.assert_eq(siptxn.matches_request(s, m(f5())), true)
+    test.assert_eq(siptxn.matches_request(s, m(f3())), false)
+    // The ACK has a branch of its own (nashds9), so it is a new transaction as a 2xx ACK is.
+    test.assert_eq(siptxn.request_key(m(f12())), "z9hG4bKnashds9|pc33.atlanta.com:-1|INVITE")
+
+fn sipuri_param(v: SipVia) -> Str
+    for p in v.params
+        if p.name == "received"
+            return p.value
+    "-"
+
+@test
+fn alices_request_is_formed_as_f1_is()
+    let via = sipmsg.new_via("UDP", "pc33.atlanta.com", -1, "z9hG4bKnashds8")
+    let req = sipbuild.new_request("INVITE", "sip:bob@biloxi.com", "Bob <sip:bob@biloxi.com>",
+        "Alice <sip:alice@atlanta.com>;tag=1928301774", "a84b4c76e66710", 314159, via, "<sip:alice@pc33.atlanta.com>", 70, [])
+    let sdp = bytes.from_str(sdp_of(f1()))
+    let full = sipmsg.with_body(req, "application/sdp", sdp)
+    test.assert_eq(bytes.to_str(sipmsg.write(full)), f1())
+
+fn sdp_of(text: Str) -> Str
+    match str.index(text, "\r\n\r\n")
+        None    => ""
+        Some(i) => str.slice(text, i + 4, str.len(text))
+
+@test
+fn bobs_ringing_and_ok_are_formed_as_f6_and_f9_are()
+    let inv = m(f5())
+    let ringing = sipbuild.new_response(inv, 180, "", "a6c85cf")
+    test.assert_eq(ringing.reason, "Ringing")
+    test.assert_eq(list.len(sipmsg.header_values(ringing, "Via")), 3)
+    test.assert_eq(sipmsg.header_value(ringing, "To") ?? "-", "Bob <sip:bob@biloxi.com>;tag=a6c85cf")
+    test.assert_eq(sipmsg.header_value(ringing, "From") ?? "-", sipmsg.header_value(m(f6()), "From") ?? "")
+    test.assert_eq(sipmsg.header_value(ringing, "Call-ID") ?? "-", "a84b4c76e66710")
+    test.assert_eq(sipmsg.header_value(ringing, "CSeq") ?? "-", "314159 INVITE")
+    let again = sipbuild.new_response(inv, 200, "OK", "ignored")
+    // A To that has a tag already keeps it; here F5's has none, so the tag is added.
+    test.assert_eq(sipmsg.header_value(again, "To") ?? "-", "Bob <sip:bob@biloxi.com>;tag=ignored")
+    let tagged = sipbuild.new_response(m(f13()), 200, "", "other")
+    test.assert_eq(sipmsg.header_value(tagged, "To") ?? "-", "Alice <sip:alice@atlanta.com>;tag=1928301774")
+    let trying = sipbuild.new_response(inv, 100, "", "t")
+    test.assert_eq(sipmsg.header_value(trying, "To") ?? "-", "Bob <sip:bob@biloxi.com>")
+
+@test
+fn alices_dialog_from_f11_and_her_ack_are_f12()
+    let d = sipdialog.from_response(m(f1()), m(f11()))!
+    test.assert_eq(d.call_id, "a84b4c76e66710")
+    test.assert_eq(d.local_tag, "1928301774")
+    test.assert_eq(d.remote_tag, "a6c85cf")
+    test.assert_eq(d.remote_target, "sip:bob@192.0.2.4")
+    test.assert_eq(d.local_seq, 314159)
+    test.assert_eq(d.is_uac, true)
+    test.assert_eq(d.state, sipdialog.DIALOG_CONFIRMED)
+    test.assert_eq(sipdialog.matches_response(d, m(f11())), true)
+    test.assert_eq(sipdialog.matches_request(d, m(f13())), true)
+    test.assert_eq(sipdialog.matches_request(d, m(f1())), false)
+    let ack = sipdialog.ack_for_2xx(d, 314159, sipmsg.new_via("UDP", "pc33.atlanta.com", -1, "z9hG4bKnashds9"))
+    let want = m(f12())
+    test.assert_eq(ack.method, want.method)
+    test.assert_eq(ack.uri, want.uri)
+    test.assert_eq(sipmsg.header_value(ack, "Via") ?? "-", sipmsg.header_value(want, "Via") ?? "")
+    test.assert_eq(sipmsg.header_value(ack, "CSeq") ?? "-", sipmsg.header_value(want, "CSeq") ?? "")
+    test.assert_eq(sipmsg.header_value(ack, "Call-ID") ?? "-", sipmsg.header_value(want, "Call-ID") ?? "")
+    test.assert_eq(sipmsg.header_value(ack, "Max-Forwards") ?? "-", "70")
+    test.assert_eq(sipmsg.header_value(ack, "To") ?? "-", "<sip:bob@biloxi.com>;tag=a6c85cf")
+    // The early dialog of the 180 is early, and a 180 without a Contact makes none.
+    let early = sipdialog.from_response(m(f1()), m(f8()))!
+    test.assert_eq(early.state, sipdialog.DIALOG_EARLY)
+
+@test
+fn bobs_dialog_from_f5_and_his_bye_are_f13()
+    var d = sipdialog.from_request(m(f5()), "a6c85cf", true)!
+    test.assert_eq(d.remote_tag, "1928301774")
+    test.assert_eq(d.remote_target, "sip:alice@pc33.atlanta.com")
+    test.assert_eq(d.remote_seq, 314159)
+    test.assert_eq(d.is_uac, false)
+    // Bob's CSeq space begins at 231.
+    d.local_seq = 230
+    let bye = sipdialog.request(var d, "BYE", sipmsg.new_via("UDP", "192.0.2.4", -1, "z9hG4bKnashds10"), "")
+    let want = m(f13())
+    test.assert_eq(bye.uri, want.uri)
+    test.assert_eq(sipmsg.header_value(bye, "CSeq") ?? "-", "231 BYE")
+    test.assert_eq(sipmsg.header_value(bye, "Call-ID") ?? "-", sipmsg.call_id(want))
+    test.assert_eq(sipmsg.header_value(bye, "Via") ?? "-", sipmsg.header_value(want, "Via") ?? "")
+    test.assert_eq(sipmsg.header_value(bye, "From") ?? "-", "<sip:bob@biloxi.com>;tag=a6c85cf")
+    test.assert_eq(sipmsg.header_value(bye, "To") ?? "-", "<sip:alice@atlanta.com>;tag=1928301774")
+    test.assert_eq(sipdialog.matches_request(d, m(f13())), false)
+    test.assert_eq(sipdialog.matches_response(d, m(f14())), true)
+    // Alice's side takes the BYE once, and a repeat of its number is refused.
+    var alice = sipdialog.from_response(m(f1()), m(f11()))!
+    test.assert_eq(sipdialog.accept_cseq(var alice, m(f13())), true)
+    test.assert_eq(sipdialog.accept_cseq(var alice, m(f13())), false)
+    test.assert_eq(alice.remote_seq, 231)

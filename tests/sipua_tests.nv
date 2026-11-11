@@ -431,3 +431,36 @@ fn sipbuild_request(method: Str, uri: Str, call_id: Str, to_tag: Str) -> SipMess
 
 fn sipbuild_cancel(call_id: Str) -> SipMessage
     sipbuild_request("CANCEL", "sip:bob@biloxi.example", call_id, "")
+
+@test
+fn a_2xx_that_makes_no_dialog_fails_the_call()
+    var a = alice("UDP")
+    let evs = sipua.ua_invite(var a, "sip:bob@biloxi.example", "", 0)
+    let ok = sipbuild_resp(msg(evs[0]), 200)
+    let got = sipua.ua_receive(var a, sipmsg.write(ok), 10)
+    test.assert_eq(first_of(got, sipua.UA_CALL_FAILED).status, 200)
+    test.assert_eq(a.calls[0].state, sipua.CALL_ENDED)
+
+@test
+fn a_datagram_source_marks_the_via_for_the_response()
+    var a = alice("UDP")
+    var b = bob("UDP")
+    let evs = sipua.ua_invite(var a, "sip:bob@biloxi.example", "", 0)
+    let inv = msg(evs[0])
+    test.assert_eq(sipmsg.via_list(inv)[0].transport, "UDP")
+    test.assert_eq(sipmsg.header_value(inv, "Via") ?? "-", "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKa3;rport")
+    let got = sipua.ua_receive_from(var b, evs[0].data, "198.51.100.9", 5099, 0)
+    let trying = msg(got[0])
+    test.assert_eq(trying.status, 100)
+    let top = sipmsg.via_list(trying)[0]
+    test.assert_eq(sipmsg.reply_host(top), "198.51.100.9")
+    test.assert_eq(sipmsg.reply_port(top), 5099)
+    // A response is passed on as it is, and so is a request with no Via or no sense.
+    test.assert_eq(list.len(sipua.ua_receive_from(var a, sipmsg.write(sipbuild_resp(inv, 100)), "198.51.100.9", 5060, 1)), 0)
+    test.assert_eq(list.len(sipua.ua_receive_from(var b, bytes.from_str("garbage"), "198.51.100.9", 5060, 1)), 0)
+    let noqvia = sipmsg.remove_header(sipbuild_request("OPTIONS", "sip:bob@biloxi.example", "c9", ""), "Via")
+    test.assert_eq(count(sipua.ua_receive_from(var b, sipmsg.write(noqvia), "198.51.100.9", 5060, 2), sipua.UA_SEND), 1)
+    // Over TCP the Via has no rport.
+    var t = alice("TCP")
+    let te = sipua.ua_invite(var t, "sip:bob@biloxi.example", "", 0)
+    test.assert_eq(sipmsg.header_value(msg(te[0]), "Via") ?? "-", "SIP/2.0/TCP 192.0.2.1:5060;branch=z9hG4bKa3")

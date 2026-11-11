@@ -1,19 +1,31 @@
 [package]
 name        = "sip-nv"
 version     = "0.1.0"
-description = "SIP for novo-lang."
+description = "SIP for novo-lang over messages the caller moves, RFC 3261: the message grammar with the headers of RFC 4475's torture messages, the URI and name-addr forms, Via with RFC 3581 rport, the four transaction machines with timers A to K and the Accepted state of RFC 6026, dialogs and their route sets, request and response forming, digest authentication (RFC 7616 and RFC 8760: MD5, SHA-256, SHA-512-256), and a user agent that registers, places and answers calls and hangs up. No sockets and no clock."
 license     = "Apache-2.0"
 stability   = "experimental"
 category    = "networking"
 layer       = "host"
-tags        = ["sip"]
+tags        = ["sip", "rfc3261", "rfc4475", "rfc7616", "rfc8760", "rfc3581", "rfc6026", "voip", "digest", "sdp", "sans-io", "state-machine"]
 repository  = "https://github.com/novolang/sip-nv"
 maintainers = ["novo-lang"]
 novo        = ">= 0.24.1"
 
+# The layer is `host`, as pop3-nv's is, because the package allocates: a
+# message is text and lists, the user agent keeps lists of transactions and
+# calls, and nothing in it is written for a device with 64 KB.  No function
+# declares an effect; every time is a number of milliseconds the caller
+# measures, and every message is bytes the caller moves.
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
 [docs.pages]
-"README.md" = "SIP"
+"README.md" = "SIP without a socket: messages, transactions, dialogs and a user agent"
 
 [dependencies]
+# sdp-nv carries the session description that a body holds (sipsdp).
 sdp-nv = "^0.1.0"
+# crypto-nv gives MD5, SHA-256 and the SHA-512 state that SHA-512/256 starts
+# from, for the digest of sipauth.
 crypto-nv = "^0.1.8"

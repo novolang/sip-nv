@@ -1,0 +1,291 @@
+// tests/siptxn_tests.nv — the four transaction machines of RFC 3261 section
+// 17 and the Accepted state of RFC 6026, driven with the clock.  The timer
+// values are those of Table 4 of RFC 3261 (T1 500 ms, T2 4 s, T4 5 s).
+
+use std.bytes
+use std.str
+use std.test
+use sipbuild
+use sipdialog
+use sipmsg
+use siptxn
+
+fn via_header(branch: Str) -> Str
+    "SIP/2.0/UDP pc33.atlanta.example:5060;branch=" + branch
+
+fn req(method: Str, branch: Str) -> SipMessage
+    sipbuild.new_request(method, "sip:bob@biloxi.example", "<sip:bob@biloxi.example>", "<sip:alice@atlanta.example>;tag=1",
+                         "cid", 1, sipmsg.parse_via(via_header(branch))!, "<sip:alice@pc33.atlanta.example>", 70, [])
+
+fn answer(r: SipMessage, status: Int) -> SipMessage
+    sipbuild.new_response(r, status, "", "tt")
+
+fn kinds(acts: [SipAction]) -> [Int]
+    var out: [Int] = []
+    for a in acts
+        list.push(out, a.kind)
+    out
+
+fn has(acts: [SipAction], kind: Int) -> Bool
+    for a in acts
+        if a.kind == kind
+            return true
+    false
+
+@test
+fn keys_name_the_transaction_a_message_belongs_to()
+    let r = req("INVITE", "z9hG4bKaa")
+    test.assert_eq(siptxn.request_key(r), "z9hG4bKaa|pc33.atlanta.example:5060|INVITE")
+    test.assert_eq(siptxn.request_key(req("ACK", "z9hG4bKaa")), "z9hG4bKaa|pc33.atlanta.example:5060|INVITE")
+    test.assert_eq(siptxn.request_key(req("CANCEL", "z9hG4bKaa")), "z9hG4bKaa|pc33.atlanta.example:5060|CANCEL")
+    test.assert_eq(siptxn.response_key(answer(r, 200)), "z9hG4bKaa|INVITE")
+    // No cookie, no key; no Via, no CSeq: nothing to match.
+    test.assert_eq(siptxn.request_key(req("INVITE", "old-style")), "")
+    test.assert_eq(siptxn.request_key(sipmsg.request("INVITE", "sip:a@b", [], bytes.from_str(""))), "")
+    test.assert_eq(siptxn.response_key(sipmsg.response(200, "OK", [], bytes.from_str(""))), "")
+    var t = siptxn.client_new(req("INVITE", "old-style"), false)
+    test.assert_eq(t.key, "")
+    test.assert_eq(siptxn.matches_response(t, answer(req("INVITE", "old-style"), 200)), false)
+    let s = siptxn.server_new(req("INVITE", "old-style"), false)
+    test.assert_eq(siptxn.matches_request(s, req("INVITE", "old-style")), false)
+    test.assert_eq(list.len(siptxn.on_response(var t, answer(req("INVITE", "old-style"), 200), 0)), 0)
+    // The sent-by is compared without case.
+    let up = sipmsg.request("INVITE", "sip:a@b", [sipmsg.header_of("Via", "SIP/2.0/UDP PC33.ATLANTA.EXAMPLE:5060;branch=z9hG4bKaa")], bytes.from_str(""))
+    test.assert_eq(siptxn.request_key(up), siptxn.request_key(r))
+
+@test
+fn a_non_invite_client_retransmits_with_timer_e_and_ends_with_timer_k()
+    let r = req("OPTIONS", "z9hG4bKe1")
+    var t = siptxn.client_new(r, false)
+    test.assert_eq(t.kind, siptxn.TXN_CLIENT_NONINVITE)
+    let first = siptxn.start(var t, 0)
+    test.assert_eq(kinds(first), [siptxn.ACT_SEND])
+    test.assert_eq(siptxn.next_deadline(t), 500)
+    // E doubles from T1 to T2 and stays there; F ends it at 64 T1.
+    test.assert_eq(list.len(siptxn.tick(var t, 499)), 0)
+    test.assert_eq(kinds(siptxn.tick(var t, 500)), [siptxn.ACT_SEND])
+    test.assert_eq(t.retx_at, 1500)
+    test.assert_eq(has(siptxn.tick(var t, 1500), siptxn.ACT_SEND), true)
+    test.assert_eq(t.retx_at, 3500)
+    test.assert_eq(has(siptxn.tick(var t, 3500), siptxn.ACT_SEND), true)
+    test.assert_eq(t.retx_at, 7500)
+    test.assert_eq(has(siptxn.tick(var t, 7500), siptxn.ACT_SEND), true)
+    test.assert_eq(t.retx_at, 11500)
+    // A provisional response moves it to Proceeding, retransmitting every T2.
+    let acts = siptxn.on_response(var t, answer(r, 100), 8000)
+    test.assert_eq(kinds(acts), [siptxn.ACT_DELIVER])
+    test.assert_eq(t.state, siptxn.TXN_PROCEEDING)
+    test.assert_eq(t.retx_at, 12000)
+    test.assert_eq(has(siptxn.tick(var t, 12000), siptxn.ACT_SEND), true)
+    test.assert_eq(t.retx_at, 16000)
+    // The final response: Completed, K for T4, and a repeat is absorbed.
+    let done = siptxn.on_response(var t, answer(r, 200), 13000)
+    test.assert_eq(kinds(done), [siptxn.ACT_DELIVER])
+    test.assert_eq(t.state, siptxn.TXN_COMPLETED)
+    test.assert_eq(t.end_at, 18000)
+    test.assert_eq(list.len(siptxn.on_response(var t, answer(r, 200), 14000)), 0)
+    test.assert_eq(list.len(siptxn.tick(var t, 17999)), 0)
+    test.assert_eq(kinds(siptxn.tick(var t, 18000)), [siptxn.ACT_TERMINATED])
+    test.assert_eq(t.state, siptxn.TXN_TERMINATED)
+    test.assert_eq(list.len(siptxn.tick(var t, 99999)), 0)
+    test.assert_eq(list.len(siptxn.on_response(var t, answer(r, 200), 99999)), 0)
+    test.assert_eq(siptxn.next_deadline(t), -1)
+
+@test
+fn a_non_invite_client_gives_up_at_timer_f()
+    let r = req("OPTIONS", "z9hG4bKe2")
+    var t = siptxn.client_new(r, false)
+    let _ = siptxn.start(var t, 1000)
+    test.assert_eq(t.timeout_at, 33000)
+    let acts = siptxn.tick(var t, 33000)
+    test.assert_eq(kinds(acts), [siptxn.ACT_TIMEOUT, siptxn.ACT_TERMINATED])
+    test.assert_eq(t.state, siptxn.TXN_TERMINATED)
+
+@test
+fn a_non_invite_client_over_tcp_has_no_retransmission_and_ends_at_once()
+    let r = req("OPTIONS", "z9hG4bKe3")
+    var t = siptxn.client_new(r, true)
+    let _ = siptxn.start(var t, 0)
+    test.assert_eq(t.retx_at, -1)
+    test.assert_eq(siptxn.next_deadline(t), 32000)
+    let acts = siptxn.on_response(var t, answer(r, 486), 100)
+    test.assert_eq(kinds(acts), [siptxn.ACT_DELIVER, siptxn.ACT_TERMINATED])
+    // A provisional response without retransmission timers.
+    var u = siptxn.client_new(r, true)
+    let _ = siptxn.start(var u, 0)
+    let _ = siptxn.on_response(var u, answer(r, 180), 10)
+    test.assert_eq(u.retx_at, -1)
+    test.assert_eq(u.state, siptxn.TXN_PROCEEDING)
+    // A response that is not its own is ignored.
+    test.assert_eq(list.len(siptxn.on_response(var u, answer(req("OPTIONS", "z9hG4bKother"), 200), 20)), 0)
+
+@test
+fn an_invite_client_retransmits_with_timer_a_and_times_out_at_timer_b()
+    let r = req("INVITE", "z9hG4bKi1")
+    var t = siptxn.client_new(r, false)
+    test.assert_eq(t.kind, siptxn.TXN_CLIENT_INVITE)
+    let _ = siptxn.start(var t, 0)
+    // A doubles without a limit: 500, 1000, 2000, 4000, 8000, 16000.
+    var at = 500
+    var gap = 500
+    for _i in 0..6
+        test.assert_eq(t.retx_at, at)
+        test.assert_eq(has(siptxn.tick(var t, at), siptxn.ACT_SEND), true)
+        gap = gap * 2
+        at = at + gap
+    let end = siptxn.tick(var t, 32000)
+    test.assert_eq(kinds(end), [siptxn.ACT_TIMEOUT, siptxn.ACT_TERMINATED])
+
+@test
+fn an_invite_client_stops_its_timers_at_a_provisional_response_and_ends_at_a_2xx()
+    let r = req("INVITE", "z9hG4bKi2")
+    var t = siptxn.client_new(r, false)
+    let _ = siptxn.start(var t, 0)
+    let ringing = siptxn.on_response(var t, answer(r, 180), 100)
+    test.assert_eq(kinds(ringing), [siptxn.ACT_DELIVER])
+    test.assert_eq(t.state, siptxn.TXN_PROCEEDING)
+    test.assert_eq(siptxn.next_deadline(t), -1)
+    let ok = siptxn.on_response(var t, answer(r, 200), 200)
+    test.assert_eq(kinds(ok), [siptxn.ACT_DELIVER, siptxn.ACT_TERMINATED])
+    test.assert_eq(t.state, siptxn.TXN_TERMINATED)
+
+@test
+fn an_invite_client_acknowledges_a_failure_and_waits_with_timer_d()
+    let r = req("INVITE", "z9hG4bKi3")
+    var t = siptxn.client_new(r, false)
+    let _ = siptxn.start(var t, 0)
+    let acts = siptxn.on_response(var t, answer(r, 486), 100)
+    test.assert_eq(kinds(acts), [siptxn.ACT_SEND, siptxn.ACT_DELIVER])
+    test.assert_eq(acts[0].message.method, "ACK")
+    test.assert_eq(sipmsg.header_value(acts[0].message, "CSeq") ?? "-", "1 ACK")
+    test.assert_eq(t.state, siptxn.TXN_COMPLETED)
+    test.assert_eq(t.end_at, 32100)
+    // A repeated final response is acknowledged again and not delivered; a 2xx is not.
+    let again = siptxn.on_response(var t, answer(r, 486), 200)
+    test.assert_eq(kinds(again), [siptxn.ACT_SEND])
+    test.assert_eq(list.len(siptxn.on_response(var t, answer(r, 200), 250)), 0)
+    test.assert_eq(kinds(siptxn.tick(var t, 32100)), [siptxn.ACT_TERMINATED])
+    // Over TCP it ends at once.
+    var u = siptxn.client_new(r, true)
+    let _ = siptxn.start(var u, 0)
+    test.assert_eq(kinds(siptxn.on_response(var u, answer(r, 603), 5)), [siptxn.ACT_SEND, siptxn.ACT_DELIVER, siptxn.ACT_TERMINATED])
+
+@test
+fn a_non_invite_server_answers_retransmissions_with_its_last_response()
+    let r = req("BYE", "z9hG4bKs1")
+    var t = siptxn.server_new(r, false)
+    test.assert_eq(t.kind, siptxn.TXN_SERVER_NONINVITE)
+    test.assert_eq(t.state, siptxn.TXN_INITIAL)
+    // Before a response there is nothing to repeat.
+    test.assert_eq(list.len(siptxn.on_request(var t, r, 10)), 0)
+    let prov = siptxn.send_response(var t, answer(r, 100), 20)
+    test.assert_eq(kinds(prov), [siptxn.ACT_SEND])
+    test.assert_eq(t.state, siptxn.TXN_PROCEEDING)
+    test.assert_eq(kinds(siptxn.on_request(var t, r, 30)), [siptxn.ACT_SEND])
+    let fin = siptxn.send_response(var t, answer(r, 200), 40)
+    test.assert_eq(kinds(fin), [siptxn.ACT_SEND])
+    test.assert_eq(t.state, siptxn.TXN_COMPLETED)
+    test.assert_eq(t.end_at, 32040)
+    test.assert_eq(list.len(siptxn.send_response(var t, answer(r, 200), 41)), 0)
+    let rep = siptxn.on_request(var t, r, 50)
+    test.assert_eq(kinds(rep), [siptxn.ACT_SEND])
+    test.assert_eq(rep[0].message.status, 200)
+    // An ACK means nothing to it; another request is not its own.
+    test.assert_eq(list.len(siptxn.on_request(var t, req("ACK", "z9hG4bKs1"), 60)), 0)
+    test.assert_eq(list.len(siptxn.on_request(var t, req("BYE", "z9hG4bKother"), 60)), 0)
+    test.assert_eq(kinds(siptxn.tick(var t, 32040)), [siptxn.ACT_TERMINATED])
+    test.assert_eq(list.len(siptxn.send_response(var t, answer(r, 200), 99999)), 0)
+    test.assert_eq(list.len(siptxn.on_request(var t, r, 99999)), 0)
+    // Over TCP the final response ends it.
+    var u = siptxn.server_new(r, true)
+    test.assert_eq(kinds(siptxn.send_response(var u, answer(r, 200), 0)), [siptxn.ACT_SEND, siptxn.ACT_TERMINATED])
+
+@test
+fn an_invite_server_repeats_a_failure_with_timer_g_and_waits_for_the_ack_with_h()
+    let r = req("INVITE", "z9hG4bKs2")
+    var t = siptxn.server_new(r, false)
+    test.assert_eq(t.kind, siptxn.TXN_SERVER_INVITE)
+    test.assert_eq(t.state, siptxn.TXN_PROCEEDING)
+    // The request again before any response: nothing to send yet.
+    test.assert_eq(list.len(siptxn.on_request(var t, r, 1)), 0)
+    let trying = siptxn.send_response(var t, answer(r, 100), 2)
+    test.assert_eq(kinds(trying), [siptxn.ACT_SEND])
+    test.assert_eq(kinds(siptxn.on_request(var t, r, 3)), [siptxn.ACT_SEND])
+    let busy = siptxn.send_response(var t, answer(r, 486), 100)
+    test.assert_eq(kinds(busy), [siptxn.ACT_SEND])
+    test.assert_eq(t.state, siptxn.TXN_COMPLETED)
+    test.assert_eq(t.retx_at, 600)
+    test.assert_eq(t.timeout_at, 32100)
+    // G: 500, 1000, 2000, 4000, 4000...
+    test.assert_eq(has(siptxn.tick(var t, 600), siptxn.ACT_SEND), true)
+    test.assert_eq(t.retx_at, 1600)
+    test.assert_eq(has(siptxn.tick(var t, 1600), siptxn.ACT_SEND), true)
+    test.assert_eq(t.retx_at, 3600)
+    test.assert_eq(has(siptxn.tick(var t, 3600), siptxn.ACT_SEND), true)
+    test.assert_eq(t.retx_at, 7600)
+    test.assert_eq(has(siptxn.tick(var t, 7600), siptxn.ACT_SEND), true)
+    test.assert_eq(t.retx_at, 11600)
+    // A request retransmission gets the response again.
+    test.assert_eq(kinds(siptxn.on_request(var t, r, 8000)), [siptxn.ACT_SEND])
+    // The ACK confirms it; I for T4.
+    let ack = siptxn.on_request(var t, req("ACK", "z9hG4bKs2"), 9000)
+    test.assert_eq(list.len(ack), 0)
+    test.assert_eq(t.state, siptxn.TXN_CONFIRMED)
+    test.assert_eq(t.end_at, 14000)
+    test.assert_eq(list.len(siptxn.on_request(var t, r, 9500)), 0)
+    test.assert_eq(list.len(siptxn.send_response(var t, answer(r, 200), 9600)), 0)
+    test.assert_eq(list.len(siptxn.on_request(var t, req("ACK", "z9hG4bKs2"), 9700)), 0)
+    test.assert_eq(kinds(siptxn.tick(var t, 14000)), [siptxn.ACT_TERMINATED])
+
+@test
+fn an_invite_server_that_gets_no_ack_times_out_at_timer_h()
+    let r = req("INVITE", "z9hG4bKs3")
+    var t = siptxn.server_new(r, false)
+    let _ = siptxn.send_response(var t, answer(r, 486), 0)
+    let acts = siptxn.tick(var t, 32000)
+    test.assert_eq(kinds(acts), [siptxn.ACT_TIMEOUT, siptxn.ACT_TERMINATED])
+    // Over TCP the ACK ends it at once, and no G runs.
+    var u = siptxn.server_new(r, true)
+    let _ = siptxn.send_response(var u, answer(r, 486), 0)
+    test.assert_eq(u.retx_at, -1)
+    test.assert_eq(kinds(siptxn.on_request(var u, req("ACK", "z9hG4bKs3"), 5)), [siptxn.ACT_TERMINATED])
+
+@test
+fn an_invite_server_with_a_2xx_is_accepted_and_hands_the_ack_to_the_user_rfc_6026()
+    let r = req("INVITE", "z9hG4bKs4")
+    var t = siptxn.server_new(r, false)
+    let ok = siptxn.send_response(var t, answer(r, 200), 1000)
+    test.assert_eq(kinds(ok), [siptxn.ACT_SEND])
+    test.assert_eq(t.state, siptxn.TXN_ACCEPTED)
+    test.assert_eq(t.end_at, 33000)
+    // The transaction does not repeat the 2xx; the user may send it again through it.
+    test.assert_eq(list.len(siptxn.on_request(var t, r, 1500)), 0)
+    test.assert_eq(kinds(siptxn.send_response(var t, answer(r, 200), 1600)), [siptxn.ACT_SEND])
+    let ack = siptxn.on_request(var t, req("ACK", "z9hG4bKs4"), 2000)
+    test.assert_eq(kinds(ack), [siptxn.ACT_DELIVER])
+    test.assert_eq(ack[0].message.method, "ACK")
+    test.assert_eq(t.state, siptxn.TXN_ACCEPTED)
+    test.assert_eq(kinds(siptxn.tick(var t, 33000)), [siptxn.ACT_TERMINATED])
+    // A provisional response first, then the 2xx.
+    var u = siptxn.server_new(r, false)
+    let _ = siptxn.send_response(var u, answer(r, 180), 0)
+    test.assert_eq(u.state, siptxn.TXN_PROCEEDING)
+    let _ = siptxn.send_response(var u, answer(r, 200), 10)
+    test.assert_eq(u.state, siptxn.TXN_ACCEPTED)
+    // Once a final response has been sent, a second one is not sent.
+    var v = siptxn.server_new(r, false)
+    let _ = siptxn.send_response(var v, answer(r, 486), 0)
+    test.assert_eq(list.len(siptxn.send_response(var v, answer(r, 200), 5)), 0)
+
+@test
+fn the_timer_values_are_those_of_rfc_3261()
+    test.assert_eq(siptxn.SIP_T1, 500)
+    test.assert_eq(siptxn.SIP_T2, 4000)
+    test.assert_eq(siptxn.SIP_T4, 5000)
+    test.assert_eq(siptxn.SIP_TIMER_D, 32000)
+    test.assert_eq(siptxn.TXN_CLIENT_INVITE, 0)
+    test.assert_eq(siptxn.TXN_CONFIRMED, 4)
+    let t = siptxn.client_new(req("OPTIONS", "z9hG4bKt"), false)
+    test.assert_eq(t.t1, 500)
+    test.assert_eq(t.t2, 4000)
+    test.assert_eq(t.t4, 5000)

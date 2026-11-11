@@ -1,0 +1,135 @@
+// tests/sipauth_tests.nv — digest authentication.
+//
+// The MD5 and SHA-256 responses are the ones of RFC 7616 section 3.9.1 (user
+// "Mufasa", realm "http-auth@example.org", password "Circle of Life", GET
+// /dir/index.html, qop auth, nc 00000001), which SIP uses unchanged
+// (RFC 3261 section 22.4).  The SHA-512-256 response is not in the RFC; it is
+// the value Python's hashlib computes for the same inputs.  The hash vectors
+// are the empty-string and "abc" digests of FIPS 180-4 and RFC 1321.
+
+use std.str
+use std.test
+use sipauth
+use siperr
+
+@test
+fn hash_functions_match_their_test_vectors()
+    test.assert_eq(sipauth.hash_hex("MD5", "")!, "d41d8cd98f00b204e9800998ecf8427e")
+    test.assert_eq(sipauth.hash_hex("md5", "abc")!, "900150983cd24fb0d6963f7d28e17f72")
+    test.assert_eq(sipauth.hash_hex("SHA-256", "abc")!, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    test.assert_eq(sipauth.hash_hex("SHA-512-256", "abc")!, "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23")
+    test.assert_eq(sipauth.hash_hex("SHA-256-sess", "abc")!, sipauth.hash_hex("SHA-256", "abc")!)
+    match sipauth.hash_hex("SHA-1", "abc")
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(e) => test.assert_eq(e.message(), "\"algorithm SHA-1\" is not a digest challenge or credentials")
+    test.assert_eq(sipauth.algorithms()[0], "SHA-512-256")
+    test.assert_eq(list.len(sipauth.algorithms()), 3)
+
+fn mufasa(alg: Str, qop: Str) -> Str
+    sipauth.digest_response(alg, "Mufasa", "http-auth@example.org", "Circle of Life",
+        "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", "GET", "/dir/index.html", qop,
+        "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ", 1)!
+
+@test
+fn the_responses_of_rfc_7616_section_3_9_1_are_reproduced()
+    test.assert_eq(mufasa("MD5", "auth"), "8ca523f5e9506fed4657c9700eebdbec")
+    test.assert_eq(mufasa("SHA-256", "auth"), "753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1")
+    test.assert_eq(mufasa("SHA-512-256", "auth"), "430d05014cecc49cab6fbe03176d41a1da86cbfe24a16580e22aaad928d960d0")
+    // Without qop the nonce count and the cnonce are not in the digest (RFC 2069 form).
+    test.assert_eq(mufasa("MD5", "") != mufasa("MD5", "auth"), true)
+    // The -sess form differs from the plain one and is deterministic.
+    test.assert_eq(mufasa("MD5-sess", "auth") != mufasa("MD5", "auth"), true)
+    test.assert_eq(mufasa("MD5-sess", "auth"), mufasa("md5-SESS", "auth"))
+    match sipauth.digest_response("MD5", "u", "r", "p", "n", "GET", "/", "auth-int", "c", 1)
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(_) => test.assert_eq(1, 1)
+    match sipauth.digest_response("NOPE", "u", "r", "p", "n", "GET", "/", "", "c", 1)
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(_) => test.assert_eq(1, 1)
+
+@test
+fn challenges_are_read()
+    let c = sipauth.parse_challenge("Digest realm=\"atlanta.example\", nonce=\"84f1c1ae6cbe5ua9c\", opaque=\"5ccc069c403ebaf9f0171e9517f40e41\", algorithm=SHA-256, qop=\"auth, auth-int\", stale=TRUE", true)!
+    test.assert_eq(c.scheme, "Digest")
+    test.assert_eq(c.realm, "atlanta.example")
+    test.assert_eq(c.nonce, "84f1c1ae6cbe5ua9c")
+    test.assert_eq(c.opaque, "5ccc069c403ebaf9f0171e9517f40e41")
+    test.assert_eq(c.algorithm, "SHA-256")
+    test.assert_eq(list.len(c.qop), 2)
+    test.assert_eq(c.stale, true)
+    test.assert_eq(c.proxy, true)
+    test.assert_eq(sipauth.offers_auth(c), true)
+    let plain = sipauth.parse_challenge("digest realm=\"r\", nonce=\"n\"", false)!
+    test.assert_eq(plain.algorithm, "MD5")
+    test.assert_eq(list.len(plain.qop), 0)
+    test.assert_eq(plain.stale, false)
+    test.assert_eq(sipauth.offers_auth(plain), false)
+    let intonly = sipauth.parse_challenge("Digest realm=\"r\", nonce=\"n\", qop=\"auth-int\"", false)!
+    test.assert_eq(sipauth.offers_auth(intonly), false)
+    for bad in ["", "Basic realm=\"r\"", "Digest", "Digest realm=\"r\"", "Digest nonce=\"n\""]
+        match sipauth.parse_challenge(bad, false)
+            Ok(_)  => test.assert_eq(bad, "was refused")
+            Err(e) => test.assert_eq(str.len(e.message()) > 0, true)
+
+@test
+fn a_challenge_is_answered_and_the_answer_is_checked()
+    let c = sipauth.parse_challenge("Digest realm=\"atlanta.example\", nonce=\"n1\", opaque=\"op\", algorithm=SHA-256, qop=\"auth\"", false)!
+    let cr = sipauth.answer(c, "alice", "secret", "REGISTER", "sip:atlanta.example", "cn1", 3)!
+    test.assert_eq(cr.qop, "auth")
+    test.assert_eq(cr.nc, 3)
+    test.assert_eq(cr.opaque, "op")
+    let value = sipauth.credentials_value(cr)
+    test.assert_eq(str.contains(value, "nc=00000003"), true)
+    test.assert_eq(str.contains(value, "qop=auth"), true)
+    test.assert_eq(str.contains(value, "algorithm=SHA-256"), true)
+    test.assert_eq(str.contains(value, "opaque=\"op\""), true)
+    let back = sipauth.parse_credentials(value)!
+    test.assert_eq(back.username, "alice")
+    test.assert_eq(back.uri, "sip:atlanta.example")
+    test.assert_eq(back.cnonce, "cn1")
+    test.assert_eq(back.nc, 3)
+    test.assert_eq(back.response, cr.response)
+    test.assert_eq(sipauth.check(back, "secret", "REGISTER"), true)
+    test.assert_eq(sipauth.check(back, "secret", "INVITE"), false)
+    test.assert_eq(sipauth.check(back, "other", "REGISTER"), false)
+    // The RFC 2069 form carries no qop, cnonce or nc.
+    let old = sipauth.parse_challenge("Digest realm=\"r\", nonce=\"n\"", false)!
+    let oc = sipauth.answer(old, "u", "p", "BYE", "sip:r", "ignored", 1)!
+    test.assert_eq(oc.qop, "")
+    let ov = sipauth.credentials_value(oc)
+    test.assert_eq(str.contains(ov, "qop"), false)
+    test.assert_eq(str.contains(ov, "opaque"), false)
+    test.assert_eq(sipauth.check(sipauth.parse_credentials(ov)!, "p", "BYE"), true)
+    // A challenge that offers only auth-int cannot be answered.
+    let intonly = sipauth.parse_challenge("Digest realm=\"r\", nonce=\"n\", qop=\"auth-int\"", false)!
+    match sipauth.answer(intonly, "u", "p", "BYE", "sip:r", "c", 1)
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(_) => test.assert_eq(1, 1)
+    // An algorithm this package does not compute.
+    let sha1 = sipauth.parse_challenge("Digest realm=\"r\", nonce=\"n\", algorithm=SHA-1", false)!
+    match sipauth.answer(sha1, "u", "p", "BYE", "sip:r", "c", 1)
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(_) => test.assert_eq(1, 1)
+    let weird = sipauth.SipCredentials { username: "u", realm: "r", nonce: "n", uri: "sip:r", response: "00", algorithm: "SHA-1",
+                                         cnonce: "", qop: "", nc: 0, opaque: "" }
+    test.assert_eq(sipauth.check(weird, "p", "BYE"), false)
+
+@test
+fn credentials_that_are_not_credentials_are_refused()
+    for bad in ["", "Basic dXNlcjpwdw==", "Digest", "Digest username=\"u\", nonce=\"n\"", "Digest response=\"r\", nonce=\"n\"",
+                "Digest username=\"u\", response=\"r\"", "Digest username=\"u\", response=\"r\", nonce=\"n\", nc=0000000g"]
+        match sipauth.parse_credentials(bad)
+            Ok(_)  => test.assert_eq(bad, "was refused")
+            Err(e) => test.assert_eq(str.len(e.message()) > 0, true)
+    // Upper-case and lower-case hexadecimal counts both read.
+    let upper = sipauth.parse_credentials("Digest username=\"u\", response=\"r\", nonce=\"n\", nc=0000000A")!
+    test.assert_eq(upper.nc, 10)
+    let lower = sipauth.parse_credentials("Digest username=\"u\", response=\"r\", nonce=\"n\", nc=000000ff, algorithm=MD5")!
+    test.assert_eq(lower.nc, 255)
+    test.assert_eq(lower.algorithm, "MD5")
+
+@test
+fn a_parameter_without_a_value_is_skipped()
+    let c = sipauth.parse_challenge("Digest realm=\"r\", stale, nonce=\"n\", flag", false)!
+    test.assert_eq(c.nonce, "n")
+    test.assert_eq(c.stale, false)

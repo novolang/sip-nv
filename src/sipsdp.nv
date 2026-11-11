@@ -1,0 +1,67 @@
+// sipsdp.nv — the session description in the body of a SIP message.
+//
+// A session description (RFC 8866) rides in the body of an INVITE, of a 2xx
+// to it, or of an ACK, under the content type `application/sdp` (RFC 3261
+// section 13.2.1, RFC 3264 for the offer and the answer).  `sdp-nv` reads and
+// writes it and answers an offer; this module is the join between that package
+// and a message.
+
+use std.bytes
+use std.str
+use sdpmsg
+use sdpparse
+use sdpwrite
+use sipmsg
+
+// Whether the message says its body is a session description.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+// use sipsdp
+//
+// fn main() [io]
+//     let m = sipmsg.with_body(sipmsg.request("INVITE", "sip:a@b", [], bytes.from_str("")), "application/sdp", bytes.from_str("v=0\r\n"))
+//     println("${sipsdp.has_sdp(m)}")   // true
+// ```
+pub fn has_sdp(m: SipMessage) -> Bool
+    let ct = str.lower(sipmsg.header_value(m, "Content-Type") ?? "")
+    str.starts_with(ct, "application/sdp") and bytes.len(m.body) > 0
+
+// Read the session description in the body of a message.  Answers the error
+// of `sdp-nv` with its line and column when the body is not one, and an error
+// at line 0 when the message does not hold one.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+// use sipsdp
+//
+// fn main() [io]
+//     let text = "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 49170 RTP/AVP 0\r\n"
+//     let m = sipmsg.with_body(sipmsg.request("INVITE", "sip:a@b", [], bytes.from_str("")), "application/sdp", bytes.from_str(text))
+//     match sipsdp.body_sdp(m)
+//         Ok(s)  => println("${s.media[0].port}")   // 49170
+//         Err(e) => println(e.message())
+// ```
+pub fn body_sdp(m: SipMessage) -> Result<sdpmsg.SdpSession, sdpmsg.SdpError>
+    if not has_sdp(m)
+        return Err(sdpmsg.error_at(0, 0, 0))
+    sdpparse.parse(sipmsg.body_text(m))
+
+// A copy of the message with the description as its body, the content type
+// `application/sdp` and a Content-Length that agrees.
+//
+// ```novo
+// use std.bytes
+// use sdpmsg
+// use sipmsg
+// use sipsdp
+//
+// fn main() [io]
+//     let s = sdpmsg.session_of(sdpmsg.origin_of("-", "1", "1", "IP4", "192.0.2.1"), "-")
+//     let m = sipsdp.with_sdp(sipmsg.request("INVITE", "sip:a@b", [], bytes.from_str("")), s)
+//     println(sipmsg.header_value(m, "Content-Type") ?? "-")   // application/sdp
+// ```
+pub fn with_sdp(m: SipMessage, s: sdpmsg.SdpSession) -> SipMessage
+    sipmsg.with_body(m, "application/sdp", bytes.from_str(sdpwrite.write(s)))

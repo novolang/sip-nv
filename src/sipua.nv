@@ -195,7 +195,10 @@ fn token(var ua: SipUa) -> Str
     ua.seed + str.from_int(ua.counter)
 
 fn fresh_via(var ua: SipUa) -> SipVia
-    sipmsg.new_via(ua.transport, ua.host, ua.port, sipbuild.new_branch(token(var ua)))
+    let v = sipmsg.new_via(ua.transport, ua.host, ua.port, sipbuild.new_branch(token(var ua)))
+    if ua.reliable
+        return v
+    sipmsg.with_rport(v)
 
 // The index of the call whose INVITE has the Call-ID, or -1.
 fn call_by_id(ua: SipUa, call_id: Str) -> Int
@@ -297,8 +300,6 @@ fn deliver(var ua: SipUa, slot: Int, resp: SipMessage, now: Int, var evs: [SipEv
             list.push(evs, event(UA_RINGING, call, resp.status, bytes.from_str(""), "", ""))
         return
     if resp.status < 300
-        if c.has_dialog
-            return
         match sipdialog.from_response(c.invite, resp)
             Err(_) =>
                 c.state = CALL_ENDED
@@ -584,6 +585,30 @@ pub fn ua_receive(var ua: SipUa, data: Bytes, now: Int) -> [SipEvent]
                     list.push(evs, event(UA_CALL_ESTABLISHED, ci, 0, bytes.from_str(""), "", ""))
                 return evs
             return new_request(var ua, m, now)
+
+// The same, for a datagram that came from `source_host` and `source_port`: the
+// Via of a request is marked with `received` and the port for `rport`, so that
+// the response the agent forms goes back to where the request came from
+// (RFC 3581).  A message that cannot be read is dropped.
+//
+// ```novo
+// use sipua
+//
+// fn main() [io]
+//     var ua = sipua.ua_new("sip:alice@atlanta.example", "sip:alice@192.0.2.1:5060", "sip:atlanta.example", "192.0.2.1", 5060, "UDP", "", "secret", "s1")
+//     println("${list.len(sipua.ua_receive_from(var ua, bytes.from_str("garbage"), "198.51.100.7", 5062, 0))}")   // 0
+// ```
+pub fn ua_receive_from(var ua: SipUa, data: Bytes, source_host: Str, source_port: Int, now: Int) -> [SipEvent]
+    match sipmsg.parse(data)
+        Err(_) => return []
+        Ok(m)  =>
+            if not m.is_request
+                return ua_receive(var ua, data, now)
+            let vias = sipmsg.via_list(m)
+            if list.len(vias) == 0
+                return ua_receive(var ua, data, now)
+            let marked = sipmsg.mark_received(vias[0], source_host, source_port)
+            ua_receive(var ua, sipmsg.write(sipmsg.set_first_via(m, sipmsg.write_via(marked))), now)
 
 // The time `now` has come: run the timers of the transactions, repeat the 2xx
 // of an incoming call, and refresh the registration when it is due.

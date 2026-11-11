@@ -31,10 +31,11 @@ for suite in "$PKG"/tests/*_tests.nv; do
   fi
 done
 
-python3 - "$WORK" <<'PY'
+python3 - "$WORK" "$PKG" <<'PY'
 import collections, glob, os, re, sys
 
 work = sys.argv[1]
+pkg = sys.argv[2]
 skip = re.compile(r'//\s*cov:\s*skip\s*[—-]+\s*(.*)')
 cov = collections.defaultdict(dict)
 for path in glob.glob(os.path.join(work, '*.lcov.info')):
@@ -61,7 +62,7 @@ total = covered = 0
 excused = []
 print('')
 for path in sorted(cov):
-    if os.sep + 'src' + os.sep not in path:
+    if not os.path.realpath(path).startswith(os.path.realpath(pkg) + os.sep + 'src' + os.sep):
         continue
     text = open(path).read().split('\n')
     lines = cov[path]

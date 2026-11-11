@@ -1,0 +1,426 @@
+// tests/sipbase_tests.nv — the string helpers, URIs, name-addr values and the
+// message grammar of RFC 3261 sections 7, 19 and 25, beyond the messages of
+// RFC 4475 and the example of section 24.2.  The expected values are written
+// from the sections they cite.
+
+use std.bytes
+use std.str
+use std.test
+use siperr
+use sipmsg
+use sipstr
+use sipuri
+
+fn msg(text: Str) -> SipMessage
+    sipmsg.parse(bytes.from_str(text))!
+
+fn fails(text: Str) -> Bool
+    match sipmsg.parse(bytes.from_str(text))
+        Err(_) => true
+        Ok(_)  => false
+
+@test
+fn numbers_have_one_to_fifteen_digits()
+    test.assert_eq(sipstr.number("0"), 0)
+    test.assert_eq(sipstr.number("0068"), 68)
+    test.assert_eq(sipstr.number("999999999999999"), 999999999999999)
+    test.assert_eq(sipstr.number("1000000000000000"), -1)
+    test.assert_eq(sipstr.number(""), -1)
+    test.assert_eq(sipstr.number("-5"), -1)
+    test.assert_eq(sipstr.number("5 "), -1)
+
+@test
+fn strings_are_compared_and_split_outside_quotes_and_brackets()
+    test.assert_eq(sipstr.eq_ci("Call-ID", "CALL-id"), true)
+    test.assert_eq(sipstr.eq_ci("a", "ab"), false)
+    let parts = sipstr.split_top("<sip:a;b>, \"x,y\" <sip:c>,  d ", 44)
+    test.assert_eq(list.len(parts), 3)
+    test.assert_eq(parts[0], "<sip:a;b>")
+    test.assert_eq(parts[1], "\"x,y\" <sip:c>")
+    test.assert_eq(parts[2], "d")
+    test.assert_eq(list.len(sipstr.split_top("", 59)), 1)
+    // A quoted pair does not end the string.
+    let q = sipstr.split_top("\"a\\\",b\",c", 44)
+    test.assert_eq(list.len(q), 2)
+    test.assert_eq(q[0], "\"a\\\",b\"")
+
+@test
+fn escapes_tokens_and_quotes()
+    test.assert_eq(sipstr.unescape("a%20b%41%7a%zz%4"), "a bAz%zz%4")
+    test.assert_eq(sipstr.unescape(""), "")
+    test.assert_eq(sipstr.is_token("Call-ID"), true)
+    test.assert_eq(sipstr.is_token("a b"), false)
+    test.assert_eq(sipstr.is_token(""), false)
+    test.assert_eq(sipstr.is_token("!%*_+`'~.-"), true)
+    test.assert_eq(sipstr.is_token("a:b"), false)
+    test.assert_eq(sipstr.unquote("\"a\\\"b\\\\\""), "a\"b\\")
+    test.assert_eq(sipstr.unquote("plain"), "plain")
+    test.assert_eq(sipstr.unquote("\"open"), "\"open")
+    test.assert_eq(sipstr.unquote("\"\""), "")
+    test.assert_eq(sipstr.quote("a\"b\\c"), "\"a\\\"b\\\\c\"")
+
+@test
+fn parameters_are_read_found_and_written()
+    let ps = sipuri.parse_params(";Tag=a73;lr; q = 0.5 ;;x=")
+    test.assert_eq(list.len(ps), 4)
+    test.assert_eq(ps[0].name, "Tag")
+    test.assert_eq(ps[2].value, "0.5")
+    test.assert_eq(ps[3].has_value, true)
+    test.assert_eq(ps[3].value, "")
+    test.assert_eq(sipuri.find_param(ps, "tag") ?? "-", "a73")
+    test.assert_eq(sipuri.find_param(ps, "lr") ?? "-", "")
+    test.assert_eq(sipuri.find_param(ps, "zz") ?? "-", "-")
+    test.assert_eq(sipuri.has_param(ps, "LR"), true)
+    test.assert_eq(sipuri.has_param(ps, "zz"), false)
+    test.assert_eq(sipuri.write_params([sipuri.param("a", "b"), sipuri.flag("c")]), ";a=b;c")
+    test.assert_eq(sipuri.write_params([]), "")
+
+@test
+fn uris_are_read_as_section_19_gives_them()
+    let u = sipuri.parse("sip:alice:secret@atlanta.example:5070;transport=tcp;lr?subject=hi&priority=urgent")!
+    test.assert_eq(u.scheme, "sip")
+    test.assert_eq(u.user, "alice")
+    test.assert_eq(u.password, "secret")
+    test.assert_eq(u.has_user, true)
+    test.assert_eq(u.host, "atlanta.example")
+    test.assert_eq(u.port, 5070)
+    test.assert_eq(list.len(u.params), 2)
+    test.assert_eq(u.headers[1].name, "priority")
+    test.assert_eq(sipuri.uri_param(u, "transport") ?? "-", "tcp")
+    test.assert_eq(sipuri.write(u), "sip:alice:secret@atlanta.example:5070;transport=tcp;lr?subject=hi&priority=urgent")
+    let host_only = sipuri.parse("SIPS:Biloxi.Example")!
+    test.assert_eq(host_only.scheme, "sips")
+    test.assert_eq(host_only.has_user, false)
+    test.assert_eq(host_only.port, -1)
+    test.assert_eq(sipuri.write(host_only), "sips:Biloxi.Example")
+    let v6 = sipuri.parse("sip:[2001:db8::10]:5060")!
+    test.assert_eq(v6.host, "[2001:db8::10]")
+    test.assert_eq(v6.port, 5060)
+    let v6n = sipuri.parse("sip:u@[::1]")!
+    test.assert_eq(v6n.host, "[::1]")
+    test.assert_eq(v6n.port, -1)
+    let tel = sipuri.parse("tel:+358-555-1234567")!
+    test.assert_eq(tel.scheme, "tel")
+    test.assert_eq(tel.opaque, "+358-555-1234567")
+    test.assert_eq(sipuri.write(tel), "tel:+358-555-1234567")
+    let flagged = sipuri.parse("sip:a@b?flag")!
+    test.assert_eq(flagged.headers[0].has_value, false)
+    test.assert_eq(sipuri.write(flagged), "sip:a@b?flag")
+    test.assert_eq(sipuri.write(sipuri.parse("sip:a@b?x=1&&y=2")!), "sip:a@b?x=1&y=2")
+
+@test
+fn uris_that_are_not_uris_are_refused()
+    for bad in ["", "sip", "sip:", "1sip:a@b", ":a@b", "sip:@host", "sip:a@", "sip:a@b:99999", "sip:a@b:x", "sip:a@b:",
+                "sip:a@[::1", "sip:a@[::1]x", "sip:a@;lr", "tel:", "sip:[]"]
+        match sipuri.parse(bad)
+            Ok(_)  => test.assert_eq(bad, "was refused")
+            Err(e) => test.assert_eq(str.len(e.message()) > 0, true)
+
+@test
+fn equality_follows_section_19_1_4()
+    let eq = fn_eq
+    test.assert_eq(eq("sip:%61lice@atlanta.com;transport=TCP", "sip:alice@AtLanTa.CoM;Transport=tcp"), true)
+    test.assert_eq(eq("sip:carol@chicago.com", "sip:carol@chicago.com;newparam=5"), true)
+    test.assert_eq(eq("sip:carol@chicago.com;security=on", "sip:carol@chicago.com;security=off"), true)
+    test.assert_eq(eq("sip:carol@chicago.com;newparam=5", "sip:carol@chicago.com;security=on"), true)
+    test.assert_eq(eq("sip:biloxi.com;transport=tcp;method=REGISTER?to=sip:bob%40biloxi.com",
+                      "sip:biloxi.com;method=REGISTER;transport=tcp?to=sip:bob%40biloxi.com"), true)
+    test.assert_eq(eq("sip:alice@atlanta.com?subject=project%20x&priority=urgent",
+                      "sip:alice@atlanta.com?priority=urgent&subject=project%20x"), true)
+    // Not equal.
+    test.assert_eq(eq("SIP:ALICE@AtLanTa.CoM;Transport=udp", "sip:alice@AtLanTa.CoM;Transport=UDP"), false)
+    test.assert_eq(eq("sip:bob@biloxi.com", "sip:bob@biloxi.com:5060"), false)
+    test.assert_eq(eq("sip:bob@biloxi.com", "sip:bob@biloxi.com;transport=udp"), false)
+    test.assert_eq(eq("sip:bob@biloxi.com", "sip:bob@biloxi.com;user=phone"), false)
+    test.assert_eq(eq("sip:bob@biloxi.com;ttl=3", "sip:bob@biloxi.com;ttl=4"), false)
+    test.assert_eq(eq("sip:bob@biloxi.com", "sips:bob@biloxi.com"), false)
+    test.assert_eq(eq("sip:bob@biloxi.com", "sip:biloxi.com"), false)
+    test.assert_eq(eq("sip:bob:a@biloxi.com", "sip:bob:b@biloxi.com"), false)
+    test.assert_eq(eq("sip:bob@biloxi.com?a=1", "sip:bob@biloxi.com"), false)
+    test.assert_eq(eq("sip:bob@biloxi.com?a=1", "sip:bob@biloxi.com?a=2"), false)
+    test.assert_eq(eq("sip:bob@biloxi.com?a=1&b=2", "sip:bob@biloxi.com?a=1&c=2"), false)
+    test.assert_eq(eq("tel:123", "tel:123"), true)
+    test.assert_eq(eq("tel:123", "tel:124"), false)
+
+fn fn_eq(a: Str, b: Str) -> Bool
+    sipuri.equal(sipuri.parse(a)!, sipuri.parse(b)!)
+
+@test
+fn name_addr_and_addr_spec_values_are_read()
+    let a = sipuri.parse_addr("\"Bob \\\"B\\\"\" <sip:bob@biloxi.example>;tag=a73kszlfl;x")!
+    test.assert_eq(a.display, "Bob \"B\"")
+    test.assert_eq(a.bracketed, true)
+    test.assert_eq(sipuri.addr_tag(a), "a73kszlfl")
+    test.assert_eq(sipuri.has_param(a.params, "x"), true)
+    test.assert_eq(sipuri.write_addr(a), "\"Bob \\\"B\\\"\" <sip:bob@biloxi.example>;tag=a73kszlfl;x")
+    let token = sipuri.parse_addr("Bob Jones <sip:bob@biloxi.example>")!
+    test.assert_eq(token.display, "Bob Jones")
+    test.assert_eq(sipuri.addr_tag(token), "")
+    let bare = sipuri.parse_addr("sip:bob@biloxi.example;tag=5")!
+    test.assert_eq(bare.bracketed, false)
+    test.assert_eq(bare.params[0].name, "tag")
+    test.assert_eq(list.len(bare.uri.params), 0)
+    test.assert_eq(list.len(bare.params), 1)
+    test.assert_eq(sipuri.write_addr(bare), "<sip:bob@biloxi.example>;tag=5")
+    let nodisplay = sipuri.parse_addr("<sip:bob@biloxi.example;lr>")!
+    test.assert_eq(nodisplay.display, "")
+    test.assert_eq(sipuri.has_param(nodisplay.uri.params, "lr"), true)
+
+@test
+fn addresses_that_are_not_addresses_are_refused()
+    for bad in ["", "<sip:a@b", "\"x\" <sip:a@b> junk", "Bob, Jones <sip:a@b>", "<not a uri>", "<sip:a@b >", "< sip:a@b>",
+                "sip:a@b?h=1", "sip:a@b,c", "nonsense", "\"abc\\", "\"a\\\""]
+        match sipuri.parse_addr(bad)
+            Ok(_)  => test.assert_eq(bad, "was refused")
+            Err(e) => test.assert_eq(str.len(e.message()) > 0, true)
+
+@test
+fn canonical_names_and_reason_phrases()
+    for pair in [["i", "Call-ID"], ["m", "Contact"], ["e", "Content-Encoding"], ["l", "Content-Length"],
+                 ["c", "Content-Type"], ["f", "From"], ["s", "Subject"], ["k", "Supported"], ["t", "To"],
+                 ["v", "Via"], ["CSEQ", "CSeq"], ["www-authenticate", "WWW-Authenticate"], ["X-Odd", "X-Odd"]]
+        test.assert_eq(sipmsg.canonical(pair[0]), pair[1])
+    test.assert_eq(sipmsg.header_of("t", "x").name, "To")
+    for code in [100, 180, 181, 182, 183, 200, 202, 300, 301, 302, 305, 380, 400, 401, 403, 404, 405, 406, 407, 408,
+                 410, 413, 414, 415, 416, 420, 421, 423, 480, 481, 482, 483, 484, 485, 486, 487, 488, 491, 493, 500,
+                 501, 502, 503, 504, 505, 513, 600, 603, 604, 606]
+        test.assert_eq(sipmsg.reason_of(code) != "Unknown", true)
+    test.assert_eq(sipmsg.reason_of(299), "Unknown")
+    test.assert_eq(sipmsg.reason_of(486), "Busy Here")
+
+fn sample() -> SipMessage
+    sipmsg.request("INVITE", "sip:b@c", [
+        sipmsg.header_of("Via", "SIP/2.0/UDP a;branch=z9hG4bK1"),
+        sipmsg.header_of("Via", "SIP/2.0/UDP b;branch=z9hG4bK2"),
+        sipmsg.header_of("Call-ID", "x"),
+        sipmsg.header_of("Subject", "s")], bytes.from_str(""))
+
+@test
+fn headers_are_found_added_set_and_removed_without_changing_the_original()
+    let m = sample()
+    test.assert_eq(list.len(sipmsg.header_values(m, "via")), 2)
+    test.assert_eq(sipmsg.header_value(m, "Subject") ?? "-", "s")
+    test.assert_eq(sipmsg.header_value(m, "To") ?? "-", "-")
+    test.assert_eq(sipmsg.has_header(m, "i"), true)
+    test.assert_eq(sipmsg.has_header(m, "To"), false)
+    let removed = sipmsg.remove_header(m, "Via")
+    test.assert_eq(list.len(removed.headers), 2)
+    test.assert_eq(list.len(m.headers), 4)
+    let replaced = sipmsg.set_header(m, "Via", "SIP/2.0/UDP z")
+    test.assert_eq(list.len(sipmsg.header_values(replaced, "Via")), 1)
+    test.assert_eq(replaced.headers[0].value, "SIP/2.0/UDP z")
+    let added = sipmsg.set_header(m, "Organization", "o")
+    test.assert_eq(added.headers[4].name, "Organization")
+    let front = sipmsg.add_header(m, "Route", "<sip:p;lr>", true)
+    test.assert_eq(front.headers[0].name, "Route")
+    let back = sipmsg.add_header(m, "Route", "<sip:p;lr>", false)
+    test.assert_eq(back.headers[4].name, "Route")
+    test.assert_eq(list.len(m.headers), 4)
+    let body = sipmsg.with_body(m, "text/plain", bytes.from_str("hello"))
+    test.assert_eq(sipmsg.header_value(body, "Content-Length") ?? "-", "5")
+    test.assert_eq(sipmsg.body_text(body), "hello")
+    test.assert_eq(bytes.len(m.body), 0)
+
+@test
+fn messages_are_written_with_a_content_length()
+    let m = sipmsg.response(180, "Ringing", [sipmsg.header_of("Call-ID", "c")], bytes.from_str(""))
+    test.assert_eq(bytes.to_str(sipmsg.write(m)), "SIP/2.0 180 Ringing\r\nCall-ID: c\r\nContent-Length: 0\r\n\r\n")
+    let r = sipmsg.request("BYE", "sip:a@b", [sipmsg.header_of("Content-Length", "2")], bytes.from_str("hi"))
+    test.assert_eq(bytes.to_str(sipmsg.write(r)), "BYE sip:a@b SIP/2.0\r\nContent-Length: 2\r\n\r\nhi")
+    let back = sipmsg.parse(sipmsg.write(r))!
+    test.assert_eq(sipmsg.body_text(back), "hi")
+    test.assert_eq(back.version, "SIP/2.0")
+
+@test
+fn start_lines_and_headers_that_are_malformed_are_refused()
+    test.assert_eq(fails("INVITE sip:a@b\r\n\r\n"), true)
+    test.assert_eq(fails("SIP/2.0\r\n\r\n"), true)
+    test.assert_eq(fails("SIP/2.0 99 X\r\n\r\n"), true)
+    test.assert_eq(fails("SIP/2.0 700 X\r\n\r\n"), true)
+    test.assert_eq(fails("SIP/2.0 2x0 X\r\n\r\n"), true)
+    test.assert_eq(fails("INV(ITE sip:a@b SIP/2.0\r\n\r\n"), true)
+    test.assert_eq(fails("INVITE sip:a@b SIP/3.0\r\n\r\n"), true)
+    test.assert_eq(fails("INVITE sip:a@b SIP/2.0\r\nNo colon here\r\n\r\n"), true)
+    test.assert_eq(fails("INVITE sip:a@b SIP/2.0\r\nbad name: x\r\n\r\n"), true)
+    test.assert_eq(fails("INVITE sip:a@b SIP/2.0\r\nCall-ID: x\r\n"), true)
+    test.assert_eq(fails(""), true)
+    test.assert_eq(fails("\r\n\r\n\r\n\r\n"), true)
+    test.assert_eq(fails("INVITE sip:a@b SIP/2.0\r\nContent-Length: x\r\n\r\n"), true)
+    test.assert_eq(fails("INVITE sip:a@b SIP/2.0\r\nContent-Length: 5\r\n\r\nabc"), true)
+    test.assert_eq(fails("INVITE sip:a@b SIP/2.0\r\nContent-Length: 1\r\nl: 2\r\n\r\nabc"), true)
+
+@test
+fn leading_crlf_folding_and_lists_are_handled()
+    let m = msg("\r\n\r\nOPTIONS sip:a@b SIP/2.0\r\nVia: SIP/2.0/UDP a;branch=z9hG4bK1,\r\n SIP/2.0/TCP b;branch=z9hG4bK2\r\nSubject: one\r\n\ttwo\r\nContact: *\r\nSupported:\r\nl: 3\r\n\r\nabcdef")
+    test.assert_eq(m.method, "OPTIONS")
+    test.assert_eq(list.len(sipmsg.header_values(m, "Via")), 2)
+    test.assert_eq(sipmsg.header_value(m, "Subject") ?? "-", "one two")
+    test.assert_eq(sipmsg.header_value(m, "Contact") ?? "-", "*")
+    test.assert_eq(list.len(sipmsg.header_values(m, "Supported")), 1)
+    test.assert_eq(sipmsg.body_text(m), "abc")
+    // A start line is not folded, so a continuation after it spoils it.
+    test.assert_eq(fails("BYE sip:a@b SIP/2.0\r\n Folded: x\r\n\r\n"), true)
+
+@test
+fn a_stream_is_cut_into_messages_by_content_length()
+    let one = "BYE sip:a@b SIP/2.0\r\nContent-Length: 3\r\n\r\nabc"
+    let two = "OPTIONS sip:a@b SIP/2.0\r\n\r\n"
+    test.assert_eq(sipmsg.frame_length(bytes.from_str(one + two))!, str.len(one))
+    test.assert_eq(sipmsg.frame_length(bytes.from_str(two))!, str.len(two))
+    test.assert_eq(sipmsg.frame_length(bytes.from_str(one))!, str.len(one))
+    test.assert_eq(sipmsg.frame_length(bytes.from_str("BYE sip:a@b SIP/2.0\r\nContent-Length: 3\r\n"))!, -1)
+    test.assert_eq(sipmsg.frame_length(bytes.from_str("BYE sip:a@b SIP/2.0\r\nContent-Length: 3\r\n\r\nab"))!, -1)
+    test.assert_eq(sipmsg.frame_length(bytes.from_str(""))!, -1)
+    test.assert_eq(sipmsg.skip_crlf(bytes.from_str("\r\n\r\nINVITE")), 4)
+    test.assert_eq(sipmsg.skip_crlf(bytes.from_str("\r\n")), 2)
+    test.assert_eq(sipmsg.skip_crlf(bytes.from_str("INVITE")), 0)
+    test.assert_eq(sipmsg.skip_crlf(bytes.from_str("\r")), 0)
+    // Leading CRLFs are skipped and counted apart.
+    test.assert_eq(sipmsg.frame_length(bytes.from_str("\r\n" + two))!, str.len(two))
+    match sipmsg.frame_length(bytes.from_str("BYE sip:a@b SIP/2.0\r\nl: x\r\n\r\n"))
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(e) => test.assert_eq(str.len(e.message()) > 0, true)
+    // An unrelated header line without a colon does not matter to the framer.
+    test.assert_eq(sipmsg.frame_length(bytes.from_str("BYE sip:a@b SIP/2.0\r\nweird\r\n\r\n"))!, 30)
+
+@test
+fn vias_are_read_written_and_judged()
+    let v = sipmsg.parse_via("SIP / 2.0 / tcp pc33.atlanta.com:5060 ; branch = z9hG4bK77 ; rport;received=192.0.2.1")!
+    test.assert_eq(v.protocol, "SIP/2.0")
+    test.assert_eq(v.transport, "TCP")
+    test.assert_eq(v.host, "pc33.atlanta.com")
+    test.assert_eq(v.port, 5060)
+    test.assert_eq(sipmsg.via_branch(v), "z9hG4bK77")
+    test.assert_eq(sipmsg.write_via(v), "SIP/2.0/TCP pc33.atlanta.com:5060;branch=z9hG4bK77;rport;received=192.0.2.1")
+    let p = sipmsg.parse_via("SIP/2.0/UDP host")!
+    test.assert_eq(p.port, -1)
+    test.assert_eq(sipmsg.via_branch(p), "")
+    test.assert_eq(sipmsg.write_via(p), "SIP/2.0/UDP host")
+    let v6 = sipmsg.parse_via("SIP/2.0/UDP [2001:db8::1]:5061;branch=z9hG4bKa")!
+    test.assert_eq(v6.host, "[2001:db8::1]")
+    test.assert_eq(v6.port, 5061)
+    let v6n = sipmsg.parse_via("SIP/2.0/UDP [::1];branch=z9hG4bKa")!
+    test.assert_eq(v6n.port, -1)
+    for bad in ["", "SIP/2.0/UDP", "SIP/2.0 host", "HTTP/2.0/UDP host", "SIP/2.0/UDP :5060", "SIP/2.0/UDP h:x", "SIP/2.0/UDP [::1",
+                "SIP/2.0/UDP [::1]x", "SIP/2.0/UDP [::1]:x", "SIP/2.0/ h", "SIP/2.0/UDP/X h"]
+        match sipmsg.parse_via(bad)
+            Ok(_)  => test.assert_eq(bad, "was refused")
+            Err(e) => test.assert_eq(str.len(e.message()) > 0, true)
+    test.assert_eq(sipmsg.branch_is_rfc3261("z9hG4bKx"), true)
+    test.assert_eq(sipmsg.branch_is_rfc3261("z9hG4bK"), false)
+    test.assert_eq(sipmsg.branch_is_rfc3261("x"), false)
+    let made = sipmsg.new_via("UDP", "h", 5060, "z9hG4bKb")
+    test.assert_eq(sipmsg.write_via(made), "SIP/2.0/UDP h:5060;branch=z9hG4bKb")
+
+@test
+fn via_list_stops_at_a_via_that_cannot_be_read()
+    let m = sipmsg.request("X", "sip:a@b", [sipmsg.header_of("Via", "SIP/2.0/UDP a"), sipmsg.header_of("Via", "junk"),
+                                            sipmsg.header_of("Via", "SIP/2.0/UDP c")], bytes.from_str(""))
+    test.assert_eq(list.len(sipmsg.via_list(m)), 1)
+
+@test
+fn cseq_call_id_and_the_addresses_are_read()
+    let m = sipmsg.request("INVITE", "sip:a@b", [sipmsg.header_of("CSeq", "314159 INVITE"), sipmsg.header_of("Call-ID", "cid"),
+                           sipmsg.header_of("From", "<sip:a@b>;tag=1"), sipmsg.header_of("To", "<sip:c@d>")], bytes.from_str(""))
+    test.assert_eq(sipmsg.cseq(m)!.seq, 314159)
+    test.assert_eq(sipmsg.cseq(m)!.method, "INVITE")
+    test.assert_eq(sipmsg.call_id(m), "cid")
+    test.assert_eq(sipuri.addr_tag(sipmsg.from_addr(m)!), "1")
+    test.assert_eq(sipmsg.to_addr(m)!.uri.host, "d")
+    let empty = sipmsg.request("INVITE", "sip:a@b", [], bytes.from_str(""))
+    test.assert_eq(sipmsg.call_id(empty), "")
+    for e in [sipmsg.cseq(empty), sipmsg.cseq(sipmsg.set_header(empty, "CSeq", "x INVITE")),
+              sipmsg.cseq(sipmsg.set_header(empty, "CSeq", "1")), sipmsg.cseq(sipmsg.set_header(empty, "CSeq", "1 A B"))]
+        match e
+            Ok(_)  => test.assert_eq(1, 2)
+            Err(x) => test.assert_eq(str.len(x.message()) > 0, true)
+    match sipmsg.from_addr(empty)
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(x) => test.assert_eq(x.message(), "the message has no From header")
+    match sipmsg.to_addr(empty)
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(x) => test.assert_eq(x.message(), "the message has no To header")
+
+@test
+fn constructing_and_describing_messages()
+    let r = sipmsg.request("OPTIONS", "sip:a@b", [], bytes.from_str(""))
+    test.assert_eq(r.is_request, true)
+    test.assert_eq(r.version, "SIP/2.0")
+    let s = sipmsg.response(486, "Busy Here", [], bytes.from_str(""))
+    test.assert_eq(s.is_request, false)
+    test.assert_eq(s.status, 486)
+    test.assert_eq(sipmsg.SIP_MAGIC, "z9hG4bK")
+
+@test
+fn every_error_has_a_sentence()
+    let errs = [SipBadUri("u"), SipBadAddr("a"), SipBadStartLine("s"), SipBadHeader("h"), SipBadVia("v"), SipBadCSeq("c"),
+                SipNoHeader("To"), SipBadLength("l"), SipBadAuth("x"), SipWrongState("not now"), SipTooLong(9)]
+    for e in errs
+        test.assert_eq(str.len(e.message()) > 4, true)
+    test.assert_eq(SipTooLong(9).message(), "a message of 9 octets is over the limit")
+    test.assert_eq(SipWrongState("not now").message(), "not now")
+
+fn valid(text: Str) -> Bool
+    match sipmsg.validate(msg(text))
+        Ok(_)  => true
+        Err(_) => false
+
+@test
+fn validation_checks_what_a_server_needs()
+    let base = "OPTIONS sip:a@b SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nTo: <sip:a@b>\r\nFrom: <sip:c@d>;tag=1\r\nCall-ID: x\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 70\r\n"
+    test.assert_eq(valid(base + "\r\n"), true)
+    test.assert_eq(valid(base + "Contact: *\r\nContact: <sip:e@f>\r\nDate: Sat, 13 Nov 2010 23:29:00 GMT\r\n\r\n"), true)
+    test.assert_eq(valid(base + "Max-Forwards: 71\r\n\r\n"), false)
+    test.assert_eq(valid(base + "Date: Sat, 13 Nov 2010 23:29:00 EST\r\n\r\n"), false)
+    test.assert_eq(valid(base + "Contact: Bob, Jones <sip:e@f>\r\n\r\n"), false)
+    test.assert_eq(valid(base + "Via: nonsense\r\n\r\n"), false)
+    test.assert_eq(valid(base + "Via: SIP/2.0/UDP h;branch=z9hG4bK\r\n\r\n"), false)
+    test.assert_eq(valid(str.replace(base, "Max-Forwards: 70", "Max-Forwards: 256") + "\r\n"), false)
+    test.assert_eq(valid(str.replace(base, "CSeq: 1 OPTIONS", "CSeq: 2147483648 OPTIONS") + "\r\n"), false)
+    test.assert_eq(valid(str.replace(base, "CSeq: 1 OPTIONS", "CSeq: 2147483647 OPTIONS") + "\r\n"), true)
+    test.assert_eq(valid(str.replace(base, "OPTIONS sip:a@b", "OPTIONS <sip:a@b>") + "\r\n"), false)
+    test.assert_eq(valid(str.replace(base, "Max-Forwards: 70\r\n", "") + "\r\n"), true)
+    test.assert_eq(valid(str.replace(base, "To: <sip:a@b>\r\n", "") + "\r\n"), false)
+    test.assert_eq(valid(str.replace(base, "From: <sip:c@d>;tag=1", "From: junk junk") + "\r\n"), false)
+    test.assert_eq(valid(str.replace(base, "Call-ID: x\r\n", "") + "\r\n"), false)
+    test.assert_eq(valid(str.replace(base, "CSeq: 1 OPTIONS\r\n", "") + "\r\n"), false)
+    test.assert_eq(valid(str.replace(base, "Via: SIP/2.0/UDP h;branch=z9hG4bKx\r\n", "") + "\r\n"), false)
+    test.assert_eq(valid(str.replace(base, "Max-Forwards: 70", "Max-Forwards: x") + "\r\n"), false)
+    // A response needs the same headers and no Max-Forwards.
+    test.assert_eq(valid("SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nTo: <sip:a@b>\r\nFrom: <sip:c@d>;tag=1\r\nCall-ID: x\r\nCSeq: 1 OPTIONS\r\n\r\n"), true)
+    test.assert_eq(valid("SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP h;branch=z9hG4bK\r\nTo: <sip:a@b>\r\nFrom: <sip:c@d>;tag=1\r\nCall-ID: x\r\nCSeq: 1 OPTIONS\r\n\r\n"), true)
+
+@test
+fn rport_and_received_follow_rfc_3581()
+    let plain = sipmsg.new_via("UDP", "pc33.example", -1, "z9hG4bKa")
+    let flagged = sipmsg.with_rport(plain)
+    test.assert_eq(sipmsg.write_via(flagged), "SIP/2.0/UDP pc33.example;branch=z9hG4bKa;rport")
+    test.assert_eq(sipmsg.write_via(sipmsg.with_rport(flagged)), sipmsg.write_via(flagged))
+    test.assert_eq(list.len(plain.params), 1)
+    // The server fills the port, and adds `received` when the source is not the sent-by host.
+    let marked = sipmsg.mark_received(flagged, "192.0.2.1", 5062)
+    test.assert_eq(sipmsg.write_via(marked), "SIP/2.0/UDP pc33.example;branch=z9hG4bKa;rport=5062;received=192.0.2.1")
+    test.assert_eq(sipmsg.reply_host(marked), "192.0.2.1")
+    test.assert_eq(sipmsg.reply_port(marked), 5062)
+    // A source that is the sent-by host adds no `received`; a stale one is replaced.
+    let same = sipmsg.mark_received(flagged, "PC33.example", 5062)
+    test.assert_eq(sipmsg.write_via(same), "SIP/2.0/UDP pc33.example;branch=z9hG4bKa;rport=5062")
+    let stale = sipmsg.parse_via("SIP/2.0/UDP h;received=198.51.100.1;branch=z9hG4bKa")!
+    test.assert_eq(sipmsg.write_via(sipmsg.mark_received(stale, "192.0.2.9", 5060)), "SIP/2.0/UDP h;branch=z9hG4bKa;received=192.0.2.9")
+    // An rport that already has a value is kept as it is.
+    let given = sipmsg.parse_via("SIP/2.0/UDP h;rport=4000")!
+    test.assert_eq(sipmsg.write_via(sipmsg.mark_received(given, "h", 5000)), "SIP/2.0/UDP h;rport=4000")
+    // Where the response goes.
+    test.assert_eq(sipmsg.reply_host(plain), "pc33.example")
+    test.assert_eq(sipmsg.reply_port(plain), 5060)
+    test.assert_eq(sipmsg.reply_port(sipmsg.parse_via("SIP/2.0/UDP h:5070")!), 5070)
+    test.assert_eq(sipmsg.reply_port(sipmsg.parse_via("SIP/2.0/TLS h")!), 5061)
+    test.assert_eq(sipmsg.reply_port(sipmsg.parse_via("SIP/2.0/UDP h:5070;rport")!), 5070)
+
+@test
+fn the_first_via_can_be_replaced()
+    let m = sample()
+    let n = sipmsg.set_first_via(m, "SIP/2.0/UDP z;branch=z9hG4bK9")
+    test.assert_eq(sipmsg.header_values(n, "Via")[0], "SIP/2.0/UDP z;branch=z9hG4bK9")
+    test.assert_eq(sipmsg.header_values(n, "Via")[1], "SIP/2.0/UDP b;branch=z9hG4bK2")
+    test.assert_eq(sipmsg.header_values(m, "Via")[0], "SIP/2.0/UDP a;branch=z9hG4bK1")

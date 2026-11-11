@@ -1,0 +1,40 @@
+// tests/sipsdp_tests.nv — a session description in the body of a message, read
+// and written through sdp-nv.  The description is the one of RFC 8866
+// section 5's shape: version, origin, name, connection, time and one medium.
+
+use std.bytes
+use std.str
+use std.test
+use sdpmsg
+use sdpparse
+use sdpwrite
+use sipmsg
+use sipsdp
+
+fn plain() -> SipMessage
+    sipmsg.request("INVITE", "sip:a@b", [], bytes.from_str(""))
+
+@test
+fn a_description_is_carried_and_read_back()
+    let s = sdpmsg.session_of(sdpmsg.origin_of("-", "1", "1", "IP4", "192.0.2.1"), "call")
+    let m = sipsdp.with_sdp(plain(), s)
+    test.assert_eq(sipmsg.header_value(m, "Content-Type") ?? "-", "application/sdp")
+    test.assert_eq(sipmsg.header_value(m, "Content-Length") ?? "-", str.from_int(bytes.len(m.body)))
+    test.assert_eq(sipsdp.has_sdp(m), true)
+    let back = sipsdp.body_sdp(sipmsg.parse(sipmsg.write(m))!)
+    match back
+        Ok(x)  => test.assert_eq(x.name, "call")
+        Err(e) => test.assert_eq(e.message(), "")
+
+@test
+fn a_message_without_one_has_none()
+    test.assert_eq(sipsdp.has_sdp(plain()), false)
+    test.assert_eq(sipsdp.has_sdp(sipmsg.with_body(plain(), "text/plain", bytes.from_str("x"))), false)
+    test.assert_eq(sipsdp.has_sdp(sipmsg.with_body(plain(), "Application/SDP", bytes.from_str(""))), false)
+    match sipsdp.body_sdp(plain())
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(e) => test.assert_eq(e.line, 0)
+    match sipsdp.body_sdp(sipmsg.with_body(plain(), "application/sdp", bytes.from_str("not sdp\r\n")))
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(e) => test.assert_eq(e.line > 0, true)
+    test.assert_eq(sipsdp.has_sdp(sipmsg.with_body(plain(), "Application/SDP", bytes.from_str("v=0\r\n"))), true)

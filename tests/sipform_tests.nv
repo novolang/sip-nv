@@ -1,0 +1,216 @@
+// tests/sipform_tests.nv — forming requests and responses (RFC 3261 sections
+// 8.1, 8.2, 9.1 and 17.1.1.3) and the route set of a dialog (section 12).
+
+use std.bytes
+use std.str
+use std.test
+use sipbuild
+use sipdialog
+use sipmsg
+
+fn via() -> SipVia
+    sipmsg.new_via("UDP", "pc33.atlanta.example", -1, sipbuild.new_branch("a1"))
+
+fn invite(routes: [Str]) -> SipMessage
+    sipbuild.new_request("INVITE", "sip:bob@biloxi.example", "Bob <sip:bob@biloxi.example>",
+                         "Alice <sip:alice@atlanta.example>;tag=88", "cid-1", 100, via(), "<sip:alice@pc33.atlanta.example>", 70, routes)
+
+@test
+fn branches_and_tags()
+    test.assert_eq(sipbuild.new_branch("x"), "z9hG4bKx")
+    test.assert_eq(sipbuild.with_tag("<sip:a@b>", "t"), "<sip:a@b>;tag=t")
+    test.assert_eq(sipbuild.with_tag("<sip:a@b>;tag=old", "t"), "<sip:a@b>;tag=old")
+    test.assert_eq(sipbuild.with_tag("<sip:a@b", "t"), "<sip:a@b;tag=t")
+    test.assert_eq(sipbuild.with_tag("<sip:a@b>;x=1", "t"), "<sip:a@b>;x=1;tag=t")
+
+@test
+fn a_request_carries_the_headers_of_section_8_1_1()
+    let r = invite(["<sip:p1.example;lr>", "<sip:p2.example;lr>"])
+    test.assert_eq(r.headers[0].name, "Route")
+    test.assert_eq(r.headers[1].value, "<sip:p2.example;lr>")
+    test.assert_eq(sipmsg.header_value(r, "Via") ?? "-", "SIP/2.0/UDP pc33.atlanta.example;branch=z9hG4bKa1")
+    test.assert_eq(sipmsg.header_value(r, "Max-Forwards") ?? "-", "70")
+    test.assert_eq(sipmsg.header_value(r, "CSeq") ?? "-", "100 INVITE")
+    test.assert_eq(sipmsg.header_value(r, "Contact") ?? "-", "<sip:alice@pc33.atlanta.example>")
+    let nocontact = sipbuild.new_request("OPTIONS", "sip:b@c", "<sip:b@c>", "<sip:a@d>;tag=1", "x", 1, via(), "", 70, [])
+    test.assert_eq(sipmsg.has_header(nocontact, "Contact"), false)
+    test.assert_eq(sipmsg.has_header(nocontact, "Route"), false)
+
+@test
+fn a_response_repeats_what_section_8_2_6_2_says()
+    let r = sipmsg.add_header(invite([]), "Record-Route", "<sip:rr.example;lr>", false)
+    let two = sipmsg.add_header(r, "Via", "SIP/2.0/UDP second;branch=z9hG4bKb2", false)
+    let ok = sipbuild.new_response(two, 200, "", "tag9")
+    test.assert_eq(list.len(sipmsg.header_values(ok, "Via")), 2)
+    test.assert_eq(sipmsg.header_value(ok, "Record-Route") ?? "-", "<sip:rr.example;lr>")
+    test.assert_eq(sipmsg.header_value(ok, "To") ?? "-", "Bob <sip:bob@biloxi.example>;tag=tag9")
+    test.assert_eq(sipmsg.header_value(ok, "CSeq") ?? "-", "100 INVITE")
+    test.assert_eq(ok.reason, "OK")
+    // A 100 does not get a tag, an empty tag adds none, and a given reason is kept.
+    test.assert_eq(sipmsg.header_value(sipbuild.new_response(two, 100, "", "t"), "To") ?? "-", "Bob <sip:bob@biloxi.example>")
+    test.assert_eq(sipmsg.header_value(sipbuild.new_response(two, 180, "", ""), "To") ?? "-", "Bob <sip:bob@biloxi.example>")
+    test.assert_eq(sipbuild.new_response(two, 486, "Not Now", "t").reason, "Not Now")
+    // A request with a tag in To keeps it.
+    let intag = sipmsg.set_header(two, "To", "<sip:bob@biloxi.example>;tag=mine")
+    test.assert_eq(sipmsg.header_value(sipbuild.new_response(intag, 200, "", "other"), "To") ?? "-", "<sip:bob@biloxi.example>;tag=mine")
+
+@test
+fn the_ack_of_a_failure_and_the_cancel_are_formed_from_the_invite()
+    let r = sipmsg.add_header(sipmsg.add_header(invite(["<sip:p1.example;lr>"]), "Via", "SIP/2.0/UDP second;branch=z9hG4bKb2", false),
+                              "Content-Type", "application/sdp", false)
+    let busy = sipbuild.new_response(r, 486, "", "bb")
+    let ack = sipbuild.ack_for_non2xx(r, busy)
+    test.assert_eq(ack.method, "ACK")
+    test.assert_eq(ack.uri, "sip:bob@biloxi.example")
+    test.assert_eq(list.len(sipmsg.header_values(ack, "Via")), 1)
+    test.assert_eq(sipmsg.header_value(ack, "Via") ?? "-", "SIP/2.0/UDP pc33.atlanta.example;branch=z9hG4bKa1")
+    test.assert_eq(sipmsg.header_value(ack, "To") ?? "-", "Bob <sip:bob@biloxi.example>;tag=bb")
+    test.assert_eq(sipmsg.header_value(ack, "CSeq") ?? "-", "100 ACK")
+    test.assert_eq(sipmsg.header_value(ack, "Route") ?? "-", "<sip:p1.example;lr>")
+    test.assert_eq(sipmsg.has_header(ack, "Content-Type"), false)
+    let cancel = sipbuild.cancel_for(r)
+    test.assert_eq(cancel.method, "CANCEL")
+    test.assert_eq(cancel.uri, r.uri)
+    test.assert_eq(sipmsg.header_value(cancel, "CSeq") ?? "-", "100 CANCEL")
+    test.assert_eq(sipmsg.header_value(cancel, "To") ?? "-", "Bob <sip:bob@biloxi.example>")
+    test.assert_eq(list.len(sipmsg.header_values(cancel, "Via")), 1)
+    test.assert_eq(sipmsg.header_value(cancel, "Route") ?? "-", "<sip:p1.example;lr>")
+    test.assert_eq(bytes.len(cancel.body), 0)
+
+@test
+fn the_status_a_server_answers_before_it_reads_the_request()
+    let ok = invite([])
+    test.assert_eq(sipbuild.request_status(ok, true), 0)
+    test.assert_eq(sipbuild.request_status(ok, false), 0)
+    test.assert_eq(sipbuild.request_status(sipmsg.remove_header(ok, "To"), false), 400)
+    test.assert_eq(sipbuild.request_status(sipmsg.set_header(ok, "Max-Forwards", "0"), true), 483)
+    test.assert_eq(sipbuild.request_status(sipmsg.set_header(ok, "Max-Forwards", "0"), false), 0)
+    test.assert_eq(sipbuild.request_status(sipmsg.remove_header(ok, "Max-Forwards"), true), 0)
+    let old = sipmsg.SipMessage { is_request: true, method: "INVITE", uri: ok.uri, status: 0, reason: "", version: "SIP/3.0",
+                                  headers: ok.headers, body: ok.body }
+    test.assert_eq(sipbuild.request_status(old, true), 505)
+
+fn confirmed(rr: [Str]) -> SipDialog
+    var inv = invite([])
+    for r in rr
+        inv = sipmsg.add_header(inv, "Record-Route", r, false)
+    var ok = sipbuild.new_response(inv, 200, "", "bb")
+    ok = sipmsg.set_header(ok, "Contact", "<sip:bob@192.0.2.4>")
+    sipdialog.from_response(inv, ok)!
+
+@test
+fn the_client_takes_the_record_route_in_reverse_the_server_in_order()
+    let d = confirmed(["<sip:p1.example;lr>", "<sip:p2.example;lr>"])
+    test.assert_eq(d.route_set[0], "<sip:p2.example;lr>")
+    test.assert_eq(d.route_set[1], "<sip:p1.example;lr>")
+    var inv = invite([])
+    inv = sipmsg.add_header(inv, "Record-Route", "<sip:p2.example;lr>", false)
+    inv = sipmsg.add_header(inv, "Record-Route", "<sip:p1.example;lr>", false)
+    let s = sipdialog.from_request(inv, "bb", true)!
+    test.assert_eq(s.route_set[0], "<sip:p2.example;lr>")
+    test.assert_eq(s.state, sipdialog.DIALOG_CONFIRMED)
+    let early = sipdialog.from_request(inv, "bb", false)!
+    test.assert_eq(early.state, sipdialog.DIALOG_EARLY)
+
+@test
+fn a_request_in_a_dialog_follows_loose_routing()
+    var d = confirmed(["<sip:p1.example;lr>", "<sip:p2.example;lr>"])
+    let bye = sipdialog.request(var d, "BYE", via(), "")
+    test.assert_eq(bye.uri, "sip:bob@192.0.2.4")
+    let routes = sipmsg.header_values(bye, "Route")
+    test.assert_eq(list.len(routes), 2)
+    test.assert_eq(routes[0], "<sip:p2.example;lr>")
+    test.assert_eq(sipmsg.header_value(bye, "CSeq") ?? "-", "101 BYE")
+    test.assert_eq(d.local_seq, 101)
+    let next = sipdialog.request(var d, "INFO", via(), "<sip:alice@pc33.atlanta.example>")
+    test.assert_eq(sipmsg.header_value(next, "CSeq") ?? "-", "102 INFO")
+    test.assert_eq(sipmsg.header_value(next, "Contact") ?? "-", "<sip:alice@pc33.atlanta.example>")
+
+@test
+fn a_request_in_a_dialog_follows_strict_routing()
+    var d = confirmed(["<sip:strict.example>", "<sip:p2.example;lr>"])
+    // The reversed set is p2 then strict, so the first is loose; build the other order.
+    var e = confirmed(["<sip:p2.example;lr>", "<sip:strict.example>"])
+    test.assert_eq(e.route_set[0], "<sip:strict.example>")
+    let bye = sipdialog.request(var e, "BYE", via(), "")
+    test.assert_eq(bye.uri, "sip:strict.example")
+    let routes = sipmsg.header_values(bye, "Route")
+    test.assert_eq(list.len(routes), 2)
+    test.assert_eq(routes[0], "<sip:p2.example;lr>")
+    test.assert_eq(routes[1], "<sip:bob@192.0.2.4>")
+    let loose = sipdialog.request(var d, "BYE", via(), "")
+    test.assert_eq(loose.uri, "sip:bob@192.0.2.4")
+    // A route that is not an address is ignored.
+    let base = confirmed([])
+    var odd = sipdialog.SipDialog { call_id: base.call_id, local_tag: base.local_tag, remote_tag: base.remote_tag,
+                                    local_seq: base.local_seq, remote_seq: base.remote_seq, local_uri: base.local_uri,
+                                    remote_uri: base.remote_uri, remote_target: base.remote_target, route_set: ["junk"],
+                                    is_uac: true, state: base.state }
+    test.assert_eq(sipdialog.request(var odd, "BYE", via(), "").uri, "sip:bob@192.0.2.4")
+
+@test
+fn a_dialog_needs_a_contact_and_tags()
+    let inv = invite([])
+    let nocontact = sipbuild.new_response(inv, 200, "", "bb")
+    match sipdialog.from_response(inv, nocontact)
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(e) => test.assert_eq(e.message(), "the message has no Contact header")
+    let notag = sipmsg.set_header(sipbuild.new_response(inv, 200, "", ""), "Contact", "<sip:bob@192.0.2.4>")
+    match sipdialog.from_response(inv, notag)
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(e) => test.assert_eq(e.message(), "the message has no To tag header")
+    let badcontact = sipmsg.set_header(sipbuild.new_response(inv, 200, "", "bb"), "Contact", "junk junk")
+    match sipdialog.from_response(inv, badcontact)
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(_) => test.assert_eq(1, 1)
+    match sipdialog.from_response(sipmsg.remove_header(inv, "From"), sipmsg.set_header(sipbuild.new_response(inv, 200, "", "bb"), "Contact", "<sip:b@c>"))
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(_) => test.assert_eq(1, 1)
+    // A request: no Contact, no From tag, or a Contact that is not an address.
+    match sipdialog.from_request(inv, "bb", false)
+        Ok(d)  => test.assert_eq(d.remote_tag, "88")
+        Err(_) => test.assert_eq(1, 2)
+    match sipdialog.from_request(sipmsg.remove_header(inv, "Contact"), "bb", false)
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(e) => test.assert_eq(e.message(), "the message has no Contact header")
+    match sipdialog.from_request(sipmsg.set_header(inv, "From", "<sip:alice@atlanta.example>"), "bb", false)
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(e) => test.assert_eq(e.message(), "the message has no From tag header")
+    match sipdialog.from_request(sipmsg.set_header(inv, "Contact", "junk junk"), "bb", false)
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(_) => test.assert_eq(1, 1)
+    match sipdialog.from_request(sipmsg.remove_header(inv, "To"), "bb", false)
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(_) => test.assert_eq(1, 1)
+    match sipdialog.from_request(sipmsg.remove_header(inv, "CSeq"), "bb", false)
+        Ok(_)  => test.assert_eq(1, 2)
+        Err(_) => test.assert_eq(1, 1)
+
+@test
+fn dialogs_recognise_their_messages_and_check_cseq()
+    let d = confirmed([])
+    let resp = sipmsg.set_header(sipbuild.new_response(invite([]), 200, "", "bb"), "Contact", "<sip:bob@192.0.2.4>")
+    test.assert_eq(sipdialog.matches_response(d, resp), true)
+    test.assert_eq(sipdialog.matches_response(d, sipmsg.set_header(resp, "Call-ID", "other")), false)
+    test.assert_eq(sipdialog.matches_response(d, sipmsg.set_header(resp, "To", "<sip:bob@biloxi.example>;tag=zz")), false)
+    test.assert_eq(sipdialog.matches_response(d, sipmsg.remove_header(resp, "From")), false)
+    test.assert_eq(sipdialog.matches_response(d, sipmsg.remove_header(resp, "To")), false)
+    let req = sipmsg.set_header(sipmsg.set_header(invite([]), "From", "<sip:bob@biloxi.example>;tag=bb"), "To", "<sip:alice@atlanta.example>;tag=88")
+    test.assert_eq(sipdialog.matches_request(d, req), true)
+    test.assert_eq(sipdialog.matches_request(d, sipmsg.set_header(req, "Call-ID", "other")), false)
+    test.assert_eq(sipdialog.matches_request(d, sipmsg.remove_header(req, "From")), false)
+    test.assert_eq(sipdialog.matches_request(d, sipmsg.remove_header(req, "To")), false)
+    var u = sipdialog.from_request(invite([]), "bb", true)!
+    test.assert_eq(sipdialog.accept_cseq(var u, sipmsg.remove_header(req, "CSeq")), false)
+    let bye = sipmsg.set_header(req, "CSeq", "101 BYE")
+    test.assert_eq(sipdialog.accept_cseq(var u, bye), true)
+    test.assert_eq(sipdialog.accept_cseq(var u, bye), false)
+    test.assert_eq(sipdialog.accept_cseq(var u, sipmsg.set_header(req, "CSeq", "50 INFO")), false)
+    test.assert_eq(sipdialog.DIALOG_TERMINATED, 2)
+    // The first request of a dialog fixes the number when none is known.
+    var fresh = confirmed([])
+    test.assert_eq(sipdialog.accept_cseq(var fresh, sipmsg.set_header(req, "CSeq", "7 INFO")), true)
+    test.assert_eq(fresh.remote_seq, 7)
+    // A UAS dialog begins its own numbering at 1.
+    var s = sipdialog.from_request(invite([]), "bb", true)!
+    test.assert_eq(sipmsg.header_value(sipdialog.request(var s, "BYE", via(), ""), "CSeq") ?? "-", "1 BYE")

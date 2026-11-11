@@ -395,8 +395,7 @@ pub fn on_request(var t: SipTxn, req: SipMessage, now: Int) -> [SipAction]
     if not matches_request(t, req) or t.state == TXN_TERMINATED
         return acts
     if req.method == "ACK"
-        if t.kind != TXN_SERVER_INVITE
-            return acts
+        // An ACK is matched as an INVITE, so this is an INVITE server transaction.
         if t.state == TXN_ACCEPTED
             list.push(acts, action(ACT_DELIVER, req))
         elif t.state == TXN_COMPLETED
