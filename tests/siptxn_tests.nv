@@ -3,10 +3,8 @@
 // values are those of Table 4 of RFC 3261 (T1 500 ms, T2 4 s, T4 5 s).
 
 use std.bytes
-use std.str
 use std.test
 use sipbuild
-use sipdialog
 use sipmsg
 use siptxn
 
@@ -50,7 +48,10 @@ fn keys_name_the_transaction_a_message_belongs_to()
     test.assert_eq(siptxn.matches_request(s, req("INVITE", "old-style")), false)
     test.assert_eq(list.len(siptxn.on_response(var t, answer(req("INVITE", "old-style"), 200), 0)), 0)
     // The sent-by is compared without case.
-    let up = sipmsg.request("INVITE", "sip:a@b", [sipmsg.header_of("Via", "SIP/2.0/UDP PC33.ATLANTA.EXAMPLE:5060;branch=z9hG4bKaa")], bytes.from_str(""))
+    let up = sipmsg.request("INVITE",
+        "sip:a@b",
+        [sipmsg.header_of("Via", "SIP/2.0/UDP PC33.ATLANTA.EXAMPLE:5060;branch=z9hG4bKaa")],
+        bytes.from_str(""))
     test.assert_eq(siptxn.request_key(up), siptxn.request_key(r))
 
 @test
@@ -168,7 +169,8 @@ fn an_invite_client_acknowledges_a_failure_and_waits_with_timer_d()
     // Over TCP it ends at once.
     var u = siptxn.client_new(r, true)
     let _ = siptxn.start(var u, 0)
-    test.assert_eq(kinds(siptxn.on_response(var u, answer(r, 603), 5)), [siptxn.ACT_SEND, siptxn.ACT_DELIVER, siptxn.ACT_TERMINATED])
+    test.assert_eq(kinds(siptxn.on_response(var u, answer(r, 603), 5)),
+        [siptxn.ACT_SEND, siptxn.ACT_DELIVER, siptxn.ACT_TERMINATED])
 
 @test
 fn a_non_invite_server_answers_retransmissions_with_its_last_response()
@@ -198,7 +200,8 @@ fn a_non_invite_server_answers_retransmissions_with_its_last_response()
     test.assert_eq(list.len(siptxn.on_request(var t, r, 99999)), 0)
     // Over TCP the final response ends it.
     var u = siptxn.server_new(r, true)
-    test.assert_eq(kinds(siptxn.send_response(var u, answer(r, 200), 0)), [siptxn.ACT_SEND, siptxn.ACT_TERMINATED])
+    test.assert_eq(kinds(siptxn.send_response(var u, answer(r, 200), 0)),
+        [siptxn.ACT_SEND, siptxn.ACT_TERMINATED])
 
 @test
 fn an_invite_server_repeats_a_failure_with_timer_g_and_waits_for_the_ack_with_h()

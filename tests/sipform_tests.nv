@@ -2,7 +2,6 @@
 // 8.1, 8.2, 9.1 and 17.1.1.3) and the route set of a dialog (section 12).
 
 use std.bytes
-use std.str
 use std.test
 use sipbuild
 use sipdialog
@@ -47,12 +46,15 @@ fn a_response_repeats_what_section_8_2_6_2_says()
     test.assert_eq(sipmsg.header_value(ok, "CSeq") ?? "-", "100 INVITE")
     test.assert_eq(ok.reason, "OK")
     // A 100 does not get a tag, an empty tag adds none, and a given reason is kept.
-    test.assert_eq(sipmsg.header_value(sipbuild.new_response(two, 100, "", "t"), "To") ?? "-", "Bob <sip:bob@biloxi.example>")
-    test.assert_eq(sipmsg.header_value(sipbuild.new_response(two, 180, "", ""), "To") ?? "-", "Bob <sip:bob@biloxi.example>")
+    test.assert_eq(sipmsg.header_value(sipbuild.new_response(two, 100, "", "t"), "To") ?? "-",
+        "Bob <sip:bob@biloxi.example>")
+    test.assert_eq(sipmsg.header_value(sipbuild.new_response(two, 180, "", ""), "To") ?? "-",
+        "Bob <sip:bob@biloxi.example>")
     test.assert_eq(sipbuild.new_response(two, 486, "Not Now", "t").reason, "Not Now")
     // A request with a tag in To keeps it.
     let intag = sipmsg.set_header(two, "To", "<sip:bob@biloxi.example>;tag=mine")
-    test.assert_eq(sipmsg.header_value(sipbuild.new_response(intag, 200, "", "other"), "To") ?? "-", "<sip:bob@biloxi.example>;tag=mine")
+    test.assert_eq(sipmsg.header_value(sipbuild.new_response(intag, 200, "", "other"), "To") ?? "-",
+        "<sip:bob@biloxi.example>;tag=mine")
 
 @test
 fn the_ack_of_a_failure_and_the_cancel_are_formed_from_the_invite()
@@ -163,7 +165,8 @@ fn a_dialog_needs_a_contact_and_tags()
     match sipdialog.from_response(inv, badcontact)
         Ok(_)  => test.assert_eq(1, 2)
         Err(_) => test.assert_eq(1, 1)
-    match sipdialog.from_response(sipmsg.remove_header(inv, "From"), sipmsg.set_header(sipbuild.new_response(inv, 200, "", "bb"), "Contact", "<sip:b@c>"))
+    match sipdialog.from_response(sipmsg.remove_header(inv, "From"),
+        sipmsg.set_header(sipbuild.new_response(inv, 200, "", "bb"), "Contact", "<sip:b@c>"))
         Ok(_)  => test.assert_eq(1, 2)
         Err(_) => test.assert_eq(1, 1)
     // A request: no Contact, no From tag, or a Contact that is not an address.
@@ -192,10 +195,13 @@ fn dialogs_recognise_their_messages_and_check_cseq()
     let resp = sipmsg.set_header(sipbuild.new_response(invite([]), 200, "", "bb"), "Contact", "<sip:bob@192.0.2.4>")
     test.assert_eq(sipdialog.matches_response(d, resp), true)
     test.assert_eq(sipdialog.matches_response(d, sipmsg.set_header(resp, "Call-ID", "other")), false)
-    test.assert_eq(sipdialog.matches_response(d, sipmsg.set_header(resp, "To", "<sip:bob@biloxi.example>;tag=zz")), false)
+    test.assert_eq(sipdialog.matches_response(d, sipmsg.set_header(resp, "To", "<sip:bob@biloxi.example>;tag=zz")),
+        false)
     test.assert_eq(sipdialog.matches_response(d, sipmsg.remove_header(resp, "From")), false)
     test.assert_eq(sipdialog.matches_response(d, sipmsg.remove_header(resp, "To")), false)
-    let req = sipmsg.set_header(sipmsg.set_header(invite([]), "From", "<sip:bob@biloxi.example>;tag=bb"), "To", "<sip:alice@atlanta.example>;tag=88")
+    let req = sipmsg.set_header(sipmsg.set_header(invite([]), "From", "<sip:bob@biloxi.example>;tag=bb"),
+        "To",
+        "<sip:alice@atlanta.example>;tag=88")
     test.assert_eq(sipdialog.matches_request(d, req), true)
     test.assert_eq(sipdialog.matches_request(d, sipmsg.set_header(req, "Call-ID", "other")), false)
     test.assert_eq(sipdialog.matches_request(d, sipmsg.remove_header(req, "From")), false)

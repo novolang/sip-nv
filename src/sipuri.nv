@@ -163,9 +163,9 @@ fn scheme_ok(s: Str) -> Bool
         return false
     for i in 0..n
         let b = str.byte_at_or(s, i, 0)
-        let letter = (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
-        let other = (b >= 48 and b <= 57) or b == 43 or b == 45 or b == 46
-        if not (letter or (i > 0 and other))
+        let letter = b >= 65 and b <= 90 or b >= 97 and b <= 122
+        let other = b >= 48 and b <= 57 or b == 43 or b == 45 or b == 46
+        if not (letter or i > 0 and other)
             return false
     true
 
@@ -213,8 +213,9 @@ fn parse_sip(t: Str, scheme: Str, rest: Str) -> Result<SipUri, SipError>
     var main = rest
     var headers: [SipParam] = []
     match str.index(rest, "?")
-        None     => main = rest
-        Some(q)  =>
+        None    =>
+            main = rest
+        Some(q) =>
             main = str.slice(rest, 0, q)
             for piece in str.split(str.slice(rest, q + 1, str.len(rest)), "&")
                 if str.len(piece) > 0
@@ -223,7 +224,8 @@ fn parse_sip(t: Str, scheme: Str, rest: Str) -> Result<SipUri, SipError>
     var hostpart = main
     var has_user = false
     match str.index(main, "@")
-        None     => hostpart = main
+        None     =>
+            hostpart = main
         Some(at) =>
             has_user = true
             userinfo = str.slice(main, 0, at)
@@ -231,7 +233,8 @@ fn parse_sip(t: Str, scheme: Str, rest: Str) -> Result<SipUri, SipError>
     var user = userinfo
     var password = ""
     match str.index(userinfo, ":")
-        None     => user = userinfo
+        None     =>
+            user = userinfo
         Some(pc) =>
             user = str.slice(userinfo, 0, pc)
             password = str.slice(userinfo, pc + 1, str.len(userinfo))
@@ -240,7 +243,7 @@ fn parse_sip(t: Str, scheme: Str, rest: Str) -> Result<SipUri, SipError>
     let pieces = str.split(hostpart, ";")
     let hp = pieces[0]
     let he = host_end(hp)
-    if he < 1 or (str.starts_with(hp, "[") and he < 3)
+    if he < 1 or str.starts_with(hp, "[") and he < 3
         return Err(SipBadUri(t))
     let host = str.slice(hp, 0, he)
     var port = -1
@@ -395,8 +398,10 @@ pub fn parse_addr(text: Str) -> Result<SipAddr, SipError>
         if str.contains(pieces[0], "?") or str.contains(pieces[0], ",")
             return Err(SipBadAddr(t))
         match parse(pieces[0])
-            Err(e) => return Err(SipBadAddr(t))
-            Ok(u)  => return Ok(SipAddr { display: "", uri: u, params: params_from(pieces, 1), bracketed: false })
+            Err(e) =>
+                return Err(SipBadAddr(t))
+            Ok(u)  =>
+                return Ok(SipAddr { display: "", uri: u, params: params_from(pieces, 1), bracketed: false })
     match str.index_from(t, ">", lt)
         None     => Err(SipBadAddr(t))
         Some(gt) =>

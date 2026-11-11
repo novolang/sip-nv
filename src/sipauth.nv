@@ -122,8 +122,9 @@ fn hex8(n: Int) -> Str
 //     let r = sipauth.digest_response("MD5", "Mufasa", "http-auth@example.org", "Circle of Life", "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", "GET", "/dir/index.html", "auth", "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ", 1)!
 //     println(r)   // 8ca523f5e9506fed4657c9700eebdbec
 // ```
-pub fn digest_response(algorithm: Str, username: Str, realm: Str, password: Str, nonce: Str, method: Str,
-                       uri: Str, qop: Str, cnonce: Str, nc: Int) -> Result<Str, SipError>
+pub fn digest_response(algorithm: Str, username: Str, realm: Str, password: Str, nonce: Str,
+                       method: Str, uri: Str, qop: Str, cnonce: Str,
+                       nc: Int) -> Result<Str, SipError>
     if qop != "" and qop != "auth"
         return Err(SipBadAuth("qop " + qop))
     var ha1 = hash_hex(algorithm, username + ":" + realm + ":" + password)!

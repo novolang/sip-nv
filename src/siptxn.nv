@@ -47,7 +47,6 @@ use std.bytes
 use std.str
 use sipbuild
 use sipmsg
-use sipstr
 
 // A client transaction for an INVITE.
 pub const TXN_CLIENT_INVITE = 0

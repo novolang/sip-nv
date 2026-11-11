@@ -87,7 +87,8 @@ fn uris_are_read_as_section_19_gives_them()
     test.assert_eq(list.len(u.params), 2)
     test.assert_eq(u.headers[1].name, "priority")
     test.assert_eq(sipuri.uri_param(u, "transport") ?? "-", "tcp")
-    test.assert_eq(sipuri.write(u), "sip:alice:secret@atlanta.example:5070;transport=tcp;lr?subject=hi&priority=urgent")
+    test.assert_eq(sipuri.write(u),
+        "sip:alice:secret@atlanta.example:5070;transport=tcp;lr?subject=hi&priority=urgent")
     let host_only = sipuri.parse("SIPS:Biloxi.Example")!
     test.assert_eq(host_only.scheme, "sips")
     test.assert_eq(host_only.has_user, false)
@@ -124,9 +125,11 @@ fn equality_follows_section_19_1_4()
     test.assert_eq(eq("sip:carol@chicago.com;security=on", "sip:carol@chicago.com;security=off"), true)
     test.assert_eq(eq("sip:carol@chicago.com;newparam=5", "sip:carol@chicago.com;security=on"), true)
     test.assert_eq(eq("sip:biloxi.com;transport=tcp;method=REGISTER?to=sip:bob%40biloxi.com",
-                      "sip:biloxi.com;method=REGISTER;transport=tcp?to=sip:bob%40biloxi.com"), true)
+                      "sip:biloxi.com;method=REGISTER;transport=tcp?to=sip:bob%40biloxi.com"),
+                      true)
     test.assert_eq(eq("sip:alice@atlanta.com?subject=project%20x&priority=urgent",
-                      "sip:alice@atlanta.com?priority=urgent&subject=project%20x"), true)
+                      "sip:alice@atlanta.com?priority=urgent&subject=project%20x"),
+                      true)
     // Not equal.
     test.assert_eq(eq("SIP:ALICE@AtLanTa.CoM;Transport=udp", "sip:alice@AtLanTa.CoM;Transport=UDP"), false)
     test.assert_eq(eq("sip:bob@biloxi.com", "sip:bob@biloxi.com:5060"), false)
@@ -193,7 +196,8 @@ fn sample() -> SipMessage
         sipmsg.header_of("Via", "SIP/2.0/UDP a;branch=z9hG4bK1"),
         sipmsg.header_of("Via", "SIP/2.0/UDP b;branch=z9hG4bK2"),
         sipmsg.header_of("Call-ID", "x"),
-        sipmsg.header_of("Subject", "s")], bytes.from_str(""))
+        sipmsg.header_of("Subject", "s")],
+        bytes.from_str(""))
 
 @test
 fn headers_are_found_added_set_and_removed_without_changing_the_original()
@@ -224,7 +228,8 @@ fn headers_are_found_added_set_and_removed_without_changing_the_original()
 @test
 fn messages_are_written_with_a_content_length()
     let m = sipmsg.response(180, "Ringing", [sipmsg.header_of("Call-ID", "c")], bytes.from_str(""))
-    test.assert_eq(bytes.to_str(sipmsg.write(m)), "SIP/2.0 180 Ringing\r\nCall-ID: c\r\nContent-Length: 0\r\n\r\n")
+    test.assert_eq(bytes.to_str(sipmsg.write(m)),
+        "SIP/2.0 180 Ringing\r\nCall-ID: c\r\nContent-Length: 0\r\n\r\n")
     let r = sipmsg.request("BYE", "sip:a@b", [sipmsg.header_of("Content-Length", "2")], bytes.from_str("hi"))
     test.assert_eq(bytes.to_str(sipmsg.write(r)), "BYE sip:a@b SIP/2.0\r\nContent-Length: 2\r\n\r\nhi")
     let back = sipmsg.parse(sipmsg.write(r))!
@@ -291,7 +296,8 @@ fn vias_are_read_written_and_judged()
     test.assert_eq(v.host, "pc33.atlanta.com")
     test.assert_eq(v.port, 5060)
     test.assert_eq(sipmsg.via_branch(v), "z9hG4bK77")
-    test.assert_eq(sipmsg.write_via(v), "SIP/2.0/TCP pc33.atlanta.com:5060;branch=z9hG4bK77;rport;received=192.0.2.1")
+    test.assert_eq(sipmsg.write_via(v),
+        "SIP/2.0/TCP pc33.atlanta.com:5060;branch=z9hG4bK77;rport;received=192.0.2.1")
     let p = sipmsg.parse_via("SIP/2.0/UDP host")!
     test.assert_eq(p.port, -1)
     test.assert_eq(sipmsg.via_branch(p), "")
@@ -315,13 +321,15 @@ fn vias_are_read_written_and_judged()
 @test
 fn via_list_stops_at_a_via_that_cannot_be_read()
     let m = sipmsg.request("X", "sip:a@b", [sipmsg.header_of("Via", "SIP/2.0/UDP a"), sipmsg.header_of("Via", "junk"),
-                                            sipmsg.header_of("Via", "SIP/2.0/UDP c")], bytes.from_str(""))
+                                            sipmsg.header_of("Via", "SIP/2.0/UDP c")],
+                                            bytes.from_str(""))
     test.assert_eq(list.len(sipmsg.via_list(m)), 1)
 
 @test
 fn cseq_call_id_and_the_addresses_are_read()
     let m = sipmsg.request("INVITE", "sip:a@b", [sipmsg.header_of("CSeq", "314159 INVITE"), sipmsg.header_of("Call-ID", "cid"),
-                           sipmsg.header_of("From", "<sip:a@b>;tag=1"), sipmsg.header_of("To", "<sip:c@d>")], bytes.from_str(""))
+                           sipmsg.header_of("From", "<sip:a@b>;tag=1"), sipmsg.header_of("To", "<sip:c@d>")],
+                           bytes.from_str(""))
     test.assert_eq(sipmsg.cseq(m)!.seq, 314159)
     test.assert_eq(sipmsg.cseq(m)!.method, "INVITE")
     test.assert_eq(sipmsg.call_id(m), "cid")
@@ -369,7 +377,8 @@ fn valid(text: Str) -> Bool
 fn validation_checks_what_a_server_needs()
     let base = "OPTIONS sip:a@b SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nTo: <sip:a@b>\r\nFrom: <sip:c@d>;tag=1\r\nCall-ID: x\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 70\r\n"
     test.assert_eq(valid(base + "\r\n"), true)
-    test.assert_eq(valid(base + "Contact: *\r\nContact: <sip:e@f>\r\nDate: Sat, 13 Nov 2010 23:29:00 GMT\r\n\r\n"), true)
+    test.assert_eq(valid(base + "Contact: *\r\nContact: <sip:e@f>\r\nDate: Sat, 13 Nov 2010 23:29:00 GMT\r\n\r\n"),
+        true)
     test.assert_eq(valid(base + "Max-Forwards: 71\r\n\r\n"), false)
     test.assert_eq(valid(base + "Date: Sat, 13 Nov 2010 23:29:00 EST\r\n\r\n"), false)
     test.assert_eq(valid(base + "Contact: Bob, Jones <sip:e@f>\r\n\r\n"), false)
@@ -387,8 +396,10 @@ fn validation_checks_what_a_server_needs()
     test.assert_eq(valid(str.replace(base, "Via: SIP/2.0/UDP h;branch=z9hG4bKx\r\n", "") + "\r\n"), false)
     test.assert_eq(valid(str.replace(base, "Max-Forwards: 70", "Max-Forwards: x") + "\r\n"), false)
     // A response needs the same headers and no Max-Forwards.
-    test.assert_eq(valid("SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nTo: <sip:a@b>\r\nFrom: <sip:c@d>;tag=1\r\nCall-ID: x\r\nCSeq: 1 OPTIONS\r\n\r\n"), true)
-    test.assert_eq(valid("SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP h;branch=z9hG4bK\r\nTo: <sip:a@b>\r\nFrom: <sip:c@d>;tag=1\r\nCall-ID: x\r\nCSeq: 1 OPTIONS\r\n\r\n"), true)
+    test.assert_eq(valid("SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nTo: <sip:a@b>\r\nFrom: <sip:c@d>;tag=1\r\nCall-ID: x\r\nCSeq: 1 OPTIONS\r\n\r\n"),
+        true)
+    test.assert_eq(valid("SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP h;branch=z9hG4bK\r\nTo: <sip:a@b>\r\nFrom: <sip:c@d>;tag=1\r\nCall-ID: x\r\nCSeq: 1 OPTIONS\r\n\r\n"),
+        true)
 
 @test
 fn rport_and_received_follow_rfc_3581()
@@ -399,14 +410,16 @@ fn rport_and_received_follow_rfc_3581()
     test.assert_eq(list.len(plain.params), 1)
     // The server fills the port, and adds `received` when the source is not the sent-by host.
     let marked = sipmsg.mark_received(flagged, "192.0.2.1", 5062)
-    test.assert_eq(sipmsg.write_via(marked), "SIP/2.0/UDP pc33.example;branch=z9hG4bKa;rport=5062;received=192.0.2.1")
+    test.assert_eq(sipmsg.write_via(marked),
+        "SIP/2.0/UDP pc33.example;branch=z9hG4bKa;rport=5062;received=192.0.2.1")
     test.assert_eq(sipmsg.reply_host(marked), "192.0.2.1")
     test.assert_eq(sipmsg.reply_port(marked), 5062)
     // A source that is the sent-by host adds no `received`; a stale one is replaced.
     let same = sipmsg.mark_received(flagged, "PC33.example", 5062)
     test.assert_eq(sipmsg.write_via(same), "SIP/2.0/UDP pc33.example;branch=z9hG4bKa;rport=5062")
     let stale = sipmsg.parse_via("SIP/2.0/UDP h;received=198.51.100.1;branch=z9hG4bKa")!
-    test.assert_eq(sipmsg.write_via(sipmsg.mark_received(stale, "192.0.2.9", 5060)), "SIP/2.0/UDP h;branch=z9hG4bKa;received=192.0.2.9")
+    test.assert_eq(sipmsg.write_via(sipmsg.mark_received(stale, "192.0.2.9", 5060)),
+        "SIP/2.0/UDP h;branch=z9hG4bKa;received=192.0.2.9")
     // An rport that already has a value is kept as it is.
     let given = sipmsg.parse_via("SIP/2.0/UDP h;rport=4000")!
     test.assert_eq(sipmsg.write_via(sipmsg.mark_received(given, "h", 5000)), "SIP/2.0/UDP h;rport=4000")

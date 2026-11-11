@@ -16,9 +16,7 @@
 
 use std.bytes
 use std.str
-use siperr
 use sipmsg
-use sipstr
 use sipuri
 
 // A branch parameter: the magic cookie and `token`, which the caller makes
@@ -63,8 +61,8 @@ pub fn with_tag(value: Str, tag: Str) -> Str
 //     let m = sipbuild.new_request("INVITE", "sip:bob@biloxi.example", "<sip:bob@biloxi.example>", "<sip:alice@atlanta.example>;tag=1928", "a84b4c", 1, via, "<sip:alice@pc33.atlanta.example>", 70, [])
 //     println("${m.method} ${sipmsg.header_value(m, "CSeq") ?? "-"} ${list.len(m.headers)}")   // INVITE 1 INVITE 7
 // ```
-pub fn new_request(method: Str, request_uri: Str, to: Str, from: Str, call_id: Str, cseq: Int, via: SipVia,
-                   contact: Str, max_forwards: Int, routes: [Str]) -> SipMessage
+pub fn new_request(method: Str, request_uri: Str, to: Str, from: Str, call_id: Str, cseq: Int,
+                   via: SipVia, contact: Str, max_forwards: Int, routes: [Str]) -> SipMessage
     var hs: [SipHeader] = []
     for r in routes
         list.push(hs, sipmsg.header_of("Route", r))
@@ -185,7 +183,8 @@ pub fn request_status(req: SipMessage, proxy: Bool) -> Int
     if str.lower(req.version) != "sip/2.0"
         return 505
     match sipmsg.validate(req)
-        Err(_) => return 400
+        Err(_) =>
+            return 400
         Ok(_)  => 0
     if proxy and (sipmsg.header_value(req, "Max-Forwards") ?? "1") == "0"
         return 483

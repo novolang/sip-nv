@@ -16,12 +16,10 @@
 // them.  The CSeq is the local number plus one; the ACK of a 2xx uses the
 // number of the INVITE and does not advance it.
 
-use std.bytes
 use std.str
 use siperr
 use sipbuild
 use sipmsg
-use sipstr
 use sipuri
 
 // The dialog was made by a provisional response (an early dialog).
@@ -84,7 +82,8 @@ pub fn from_response(req: SipMessage, resp: SipMessage) -> Result<SipDialog, Sip
     let seq = sipmsg.cseq(req)!
     let contact = sipmsg.header_value(resp, "Contact")
     match contact
-        None    => return Err(SipNoHeader("Contact"))
+        None    =>
+            return Err(SipNoHeader("Contact"))
         Some(c) =>
             let target = uri_text(c)!
             if str.len(sipuri.addr_tag(to)) == 0
@@ -152,11 +151,14 @@ pub fn matches_request(d: SipDialog, req: SipMessage) -> Bool
     if sipmsg.call_id(req) != d.call_id
         return false
     match sipmsg.from_addr(req)
-        Err(_) => return false
+        Err(_) =>
+            return false
         Ok(f)  =>
             match sipmsg.to_addr(req)
-                Err(_) => return false
-                Ok(t)  => return sipuri.addr_tag(f) == d.remote_tag and sipuri.addr_tag(t) == d.local_tag
+                Err(_) =>
+                    return false
+                Ok(t)  =>
+                    return sipuri.addr_tag(f) == d.remote_tag and sipuri.addr_tag(t) == d.local_tag
 
 // Whether a response received belongs to the dialog: the Call-ID agrees, the
 // From tag is the local tag and the To tag is the remote tag.
@@ -177,11 +179,14 @@ pub fn matches_response(d: SipDialog, resp: SipMessage) -> Bool
     if sipmsg.call_id(resp) != d.call_id
         return false
     match sipmsg.from_addr(resp)
-        Err(_) => return false
+        Err(_) =>
+            return false
         Ok(f)  =>
             match sipmsg.to_addr(resp)
-                Err(_) => return false
-                Ok(t)  => return sipuri.addr_tag(f) == d.local_tag and sipuri.addr_tag(t) == d.remote_tag
+                Err(_) =>
+                    return false
+                Ok(t)  =>
+                    return sipuri.addr_tag(f) == d.local_tag and sipuri.addr_tag(t) == d.remote_tag
 
 // Check the CSeq of a request received in the dialog (section 12.2.2): it must be
 // above the last one, otherwise the answer is 500.  Answers true and records the

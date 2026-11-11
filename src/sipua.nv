@@ -169,13 +169,15 @@ pub struct SipUa
 //     let ua = sipua.ua_new("sip:alice@atlanta.example", "sip:alice@192.0.2.1:5060", "sip:atlanta.example", "192.0.2.1", 5060, "UDP", "", "secret", "s1")
 //     println("${ua.reg_state} ${ua.username}")   // 0 alice
 // ```
-pub fn ua_new(aor: Str, contact: Str, registrar: Str, host: Str, port: Int, transport: Str, username: Str,
-              password: Str, seed: Str) -> SipUa
+pub fn ua_new(aor: Str, contact: Str, registrar: Str, host: Str, port: Int, transport: Str,
+              username: Str, password: Str, seed: Str) -> SipUa
     var user = username
     if str.len(user) == 0
         match sipuri.parse(aor)
-            Err(_) => user = aor
-            Ok(u)  => user = u.user
+            Err(_) =>
+                user = aor
+            Ok(u)  =>
+                user = u.user
     SipUa { aor: aor, contact: contact, registrar: registrar, host: host, port: port, transport: transport,
             reliable: transport != "UDP", username: user, password: password, seed: seed, counter: 0,
             reg_state: REG_NONE, reg_call_id: "", reg_cseq: 0, reg_expires: 0, reg_at: -1,
@@ -269,7 +271,8 @@ fn deliver(var ua: SipUa, slot: Int, resp: SipMessage, now: Int, var evs: [SipEv
             var granted = ua.reg_expires
             let h = sipmsg.header_value(resp, "Expires")
             match h
-                None    => granted = ua.reg_expires
+                None    =>
+                    granted = ua.reg_expires
                 Some(x) =>
                     if sipstr.number(x) >= 0
                         granted = sipstr.number(x)
@@ -281,7 +284,8 @@ fn deliver(var ua: SipUa, slot: Int, resp: SipMessage, now: Int, var evs: [SipEv
             return
         if (resp.status == 401 or resp.status == 407) and not ua.reg_auth_tried
             match retried(var ua, ua.reg_request, resp)
-                Err(_) => ua.reg_state = REG_FAILED
+                Err(_) =>
+                    ua.reg_state = REG_FAILED
                 Ok(r)  =>
                     ua.reg_auth_tried = true
                     ua.reg_request = r
@@ -312,11 +316,13 @@ fn deliver(var ua: SipUa, slot: Int, resp: SipMessage, now: Int, var evs: [SipEv
                 let inv = sipmsg.cseq(c.invite)!
                 c.ack = sipdialog.ack_for_2xx(d, inv.seq, fresh_via(var ua))
                 list.push(evs, send_event(c.ack, call))
-                list.push(evs, event(UA_ANSWERED, call, resp.status, bytes.from_str(""), c.peer, c.remote_sdp))
+                list.push(evs,
+                    event(UA_ANSWERED, call, resp.status, bytes.from_str(""), c.peer, c.remote_sdp))
         return
     if (resp.status == 401 or resp.status == 407) and not c.auth_tried
         match retried(var ua, c.invite, resp)
-            Err(_) => c.state = CALL_ENDED
+            Err(_) =>
+                c.state = CALL_ENDED
             Ok(r)  =>
                 c.auth_tried = true
                 c.invite = r
@@ -501,7 +507,12 @@ fn new_request(var ua: SipUa, req: SipMessage, now: Int) -> [SipEvent]
                 let si = list.len(ua.slots) - 1
                 let trying = sipbuild.new_response(req, 100, "", "")
                 run(var ua, si, siptxn.send_response(var t, trying, now), now, var evs)
-                list.push(evs, event(UA_INCOMING, id, 0, bytes.from_str(""), sipuri.write(from.uri), sipmsg.body_text(req)))
+                list.push(evs, event(UA_INCOMING,
+                    id,
+                    0,
+                    bytes.from_str(""),
+                    sipuri.write(from.uri),
+                    sipmsg.body_text(req)))
         return evs
     if req.method == "BYE"
         let ci = call_by_id(ua, sipmsg.call_id(req))
@@ -526,7 +537,11 @@ fn new_request(var ua: SipUa, req: SipMessage, now: Int) -> [SipEvent]
         var status = 481
         if ci >= 0 and ua.calls[ci].state == CALL_INCOMING
             status = 200
-        run(var ua, si, siptxn.send_response(var t, sipbuild.new_response(req, status, "", ""), now), now, var evs)
+        run(var ua,
+            si,
+            siptxn.send_response(var t, sipbuild.new_response(req, status, "", ""), now),
+            now,
+            var evs)
         if status == 200
             let ii = invite_slot(ua, ci)
             var it = ua.slots[ii].txn
@@ -558,7 +573,8 @@ fn new_request(var ua: SipUa, req: SipMessage, now: Int) -> [SipEvent]
 pub fn ua_receive(var ua: SipUa, data: Bytes, now: Int) -> [SipEvent]
     var evs: [SipEvent] = []
     match sipmsg.parse(data)
-        Err(_) => return evs
+        Err(_) =>
+            return evs
         Ok(m)  =>
             if not m.is_request
                 for i in 0..list.len(ua.slots)
@@ -598,9 +614,11 @@ pub fn ua_receive(var ua: SipUa, data: Bytes, now: Int) -> [SipEvent]
 //     var ua = sipua.ua_new("sip:alice@atlanta.example", "sip:alice@192.0.2.1:5060", "sip:atlanta.example", "192.0.2.1", 5060, "UDP", "", "secret", "s1")
 //     println("${list.len(sipua.ua_receive_from(var ua, bytes.from_str("garbage"), "198.51.100.7", 5062, 0))}")   // 0
 // ```
-pub fn ua_receive_from(var ua: SipUa, data: Bytes, source_host: Str, source_port: Int, now: Int) -> [SipEvent]
+pub fn ua_receive_from(var ua: SipUa, data: Bytes, source_host: Str, source_port: Int,
+                       now: Int) -> [SipEvent]
     match sipmsg.parse(data)
-        Err(_) => return []
+        Err(_) =>
+            return []
         Ok(m)  =>
             if not m.is_request
                 return ua_receive(var ua, data, now)

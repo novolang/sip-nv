@@ -103,7 +103,8 @@ fn register_answers_a_challenge_once_and_is_refreshed()
     test.assert_eq(sipauth.check(cr, "wrong", "REGISTER"), false)
     // A second challenge is a failure.
     let again2 = sipua.ua_receive(var ua, sipmsg.write(sipmsg.set_header(sipbuild_response(req2, 401), "WWW-Authenticate",
-        "Digest realm=\"atlanta.example\", nonce=\"zz\"")), 1200)
+        "Digest realm=\"atlanta.example\", nonce=\"zz\"")),
+        1200)
     test.assert_eq(first_of(again2, sipua.UA_REGISTER_FAILED).status, 401)
     test.assert_eq(ua.reg_state, sipua.REG_FAILED)
 
@@ -174,7 +175,13 @@ fn a_call_is_placed_answered_and_hung_up()
     var b = bob("UDP")
     var sa: [SipEvent] = []
     var sb: [SipEvent] = []
-    wire(var a, var b, sipua.ua_invite(var a, "sip:bob@biloxi.example", "v=0\r\ns=offer\r\n", 0), 0, "-", var sa, var sb)
+    wire(var a,
+        var b,
+        sipua.ua_invite(var a, "sip:bob@biloxi.example", "v=0\r\ns=offer\r\n", 0),
+        0,
+        "-",
+        var sa,
+        var sb)
     let inc = first_of(sb, sipua.UA_INCOMING)
     test.assert_eq(inc.text, "sip:alice@atlanta.example")
     test.assert_eq(inc.body, "v=0\r\ns=offer\r\n")
@@ -189,7 +196,13 @@ fn a_call_is_placed_answered_and_hung_up()
     test.assert_eq(a.calls[0].state, sipua.CALL_RINGING)
     var sa3: [SipEvent] = []
     var sb3: [SipEvent] = []
-    wire(var b, var a, sipua.ua_answer(var b, 0, 200, "v=0\r\ns=answer\r\n", 200), 200, "-", var sb3, var sa3)
+    wire(var b,
+        var a,
+        sipua.ua_answer(var b, 0, 200, "v=0\r\ns=answer\r\n", 200),
+        200,
+        "-",
+        var sb3,
+        var sa3)
     let ans = first_of(sa3, sipua.UA_ANSWERED)
     test.assert_eq(ans.body, "v=0\r\ns=answer\r\n")
     test.assert_eq(ans.status, 200)
@@ -344,7 +357,9 @@ fn an_invite_is_answered_with_credentials_once()
     test.assert_eq(sipmsg.has_header(inv2, "Proxy-Authorization"), true)
     test.assert_eq(sipmsg.body_text(inv2), "v=0\r\n")
     // Another 407 ends the call.
-    let again = sipmsg.set_header(sipbuild_response(inv2, 407), "Proxy-Authenticate", "Digest realm=\"biloxi.example\", nonce=\"abd\"")
+    let again = sipmsg.set_header(sipbuild_response(inv2, 407),
+        "Proxy-Authenticate",
+        "Digest realm=\"biloxi.example\", nonce=\"abd\"")
     let end = sipua.ua_receive(var a, sipmsg.write(again), 20)
     test.assert_eq(first_of(end, sipua.UA_CALL_FAILED).status, 407)
     // A challenge nobody can read ends it at once.
@@ -404,7 +419,8 @@ fn requests_the_agent_does_not_serve_are_refused()
     test.assert_eq(list.len(sipua.ua_receive(var b, sipmsg.write(ack), 2)), 0)
     // A response nobody waits for is dropped, and a repeated 2xx for an unknown call too.
     let stray = sipbuild_resp(opts, 200)
-    test.assert_eq(list.len(sipua.ua_receive(var b, sipmsg.write(sipmsg.set_header(stray, "CSeq", "9 INVITE")), 3)), 0)
+    test.assert_eq(list.len(sipua.ua_receive(var b, sipmsg.write(sipmsg.set_header(stray, "CSeq", "9 INVITE")), 3)),
+        0)
     test.assert_eq(list.len(sipua.ua_receive(var b, bytes.from_str("not sip\r\n\r\n"), 3)), 0)
 
 fn sipbuild_resp(req: SipMessage, status: Int) -> SipMessage
@@ -413,7 +429,8 @@ fn sipbuild_resp(req: SipMessage, status: Int) -> SipMessage
         sipmsg.header_of("To", sipmsg.header_value(req, "To") ?? ""),
         sipmsg.header_of("From", sipmsg.header_value(req, "From") ?? ""),
         sipmsg.header_of("Call-ID", sipmsg.call_id(req)),
-        sipmsg.header_of("CSeq", sipmsg.header_value(req, "CSeq") ?? "")], bytes.from_str(""))
+        sipmsg.header_of("CSeq", sipmsg.header_value(req, "CSeq") ?? "")],
+        bytes.from_str(""))
 
 // A request from a remote party, with a branch that is its own.
 fn sipbuild_request(method: Str, uri: Str, call_id: Str, to_tag: Str) -> SipMessage
@@ -427,7 +444,8 @@ fn sipbuild_request(method: Str, uri: Str, call_id: Str, to_tag: Str) -> SipMess
         sipmsg.header_of("From", "<sip:carol@chicago.example>;tag=ct"),
         sipmsg.header_of("Call-ID", call_id),
         sipmsg.header_of("CSeq", "1 " + method),
-        sipmsg.header_of("Contact", "<sip:carol@198.51.100.7:5060>")], bytes.from_str(""))
+        sipmsg.header_of("Contact", "<sip:carol@198.51.100.7:5060>")],
+        bytes.from_str(""))
 
 fn sipbuild_cancel(call_id: Str) -> SipMessage
     sipbuild_request("CANCEL", "sip:bob@biloxi.example", call_id, "")
@@ -456,10 +474,12 @@ fn a_datagram_source_marks_the_via_for_the_response()
     test.assert_eq(sipmsg.reply_host(top), "198.51.100.9")
     test.assert_eq(sipmsg.reply_port(top), 5099)
     // A response is passed on as it is, and so is a request with no Via or no sense.
-    test.assert_eq(list.len(sipua.ua_receive_from(var a, sipmsg.write(sipbuild_resp(inv, 100)), "198.51.100.9", 5060, 1)), 0)
+    test.assert_eq(list.len(sipua.ua_receive_from(var a, sipmsg.write(sipbuild_resp(inv, 100)), "198.51.100.9", 5060, 1)),
+        0)
     test.assert_eq(list.len(sipua.ua_receive_from(var b, bytes.from_str("garbage"), "198.51.100.9", 5060, 1)), 0)
     let noqvia = sipmsg.remove_header(sipbuild_request("OPTIONS", "sip:bob@biloxi.example", "c9", ""), "Via")
-    test.assert_eq(count(sipua.ua_receive_from(var b, sipmsg.write(noqvia), "198.51.100.9", 5060, 2), sipua.UA_SEND), 1)
+    test.assert_eq(count(sipua.ua_receive_from(var b, sipmsg.write(noqvia), "198.51.100.9", 5060, 2), sipua.UA_SEND),
+        1)
     // Over TCP the Via has no rport.
     var t = alice("TCP")
     let te = sipua.ua_invite(var t, "sip:bob@biloxi.example", "", 0)

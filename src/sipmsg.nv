@@ -477,7 +477,7 @@ pub fn parse(raw: Bytes) -> Result<SipMessage, SipError>
     for h in hs
         if h.name == "Content-Length"
             let n = sipstr.number(h.value)
-            if n < 0 or (cl >= 0 and n != cl)
+            if n < 0 or cl >= 0 and n != cl
                 return Err(SipBadLength(h.value))
             cl = n
     if cl >= 0
@@ -612,7 +612,8 @@ pub fn parse_via(text: Str) -> Result<SipVia, SipError>
     var port = -1
     if str.starts_with(sent_by, "[")
         match str.index(sent_by, "]")
-            None     => return Err(SipBadVia(text))
+            None     =>
+                return Err(SipBadVia(text))
             Some(rb) =>
                 host = str.slice(sent_by, 0, rb + 1)
                 if rb + 1 < str.len(sent_by)
@@ -621,7 +622,8 @@ pub fn parse_via(text: Str) -> Result<SipVia, SipError>
                         return Err(SipBadVia(text))
     else
         match str.index(sent_by, ":")
-            None     => host = sent_by
+            None     =>
+                host = sent_by
             Some(co) =>
                 host = str.slice(sent_by, 0, co)
                 port = sipstr.number(str.slice(sent_by, co + 1, str.len(sent_by)))
@@ -634,7 +636,11 @@ pub fn parse_via(text: Str) -> Result<SipVia, SipError>
         if str.len(pieces[i]) > 0
             for p in sipuri.parse_params(pieces[i])
                 list.push(params, p)
-    Ok(SipVia { protocol: ps[0] + "/" + ps[1], transport: str.upper(ps[2]), host: host, port: port, params: params })
+    Ok(SipVia { protocol: ps[0] + "/" + ps[1],
+        transport: str.upper(ps[2]),
+        host: host,
+        port: port,
+        params: params })
 
 // Write a Via value.
 //
@@ -775,7 +781,8 @@ pub fn via_list(m: SipMessage) -> [SipVia]
     for v in header_values(m, "Via")
         match parse_via(v)
             Ok(x)  => list.push(out, x)
-            Err(_) => return out
+            Err(_) =>
+                return out
     out
 
 // Read the CSeq of a message.
@@ -874,7 +881,8 @@ fn once(m: SipMessage, name: Str) -> Bool
 pub fn validate(m: SipMessage) -> Result<Int, SipError>
     if m.is_request
         match sipuri.parse(m.uri)
-            Err(_) => return Err(SipBadUri(m.uri))
+            Err(_) =>
+                return Err(SipBadUri(m.uri))
             Ok(_)  => 0
     for name in ["To", "From", "CSeq", "Call-ID", "Via"]
         if not has_header(m, name)

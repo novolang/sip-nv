@@ -131,7 +131,7 @@ pub fn is_token(s: Str) -> Bool
         return false
     for i in 0..n
         let b = str.byte_at_or(s, i, 0)
-        let alnum = (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
+        let alnum = b >= 48 and b <= 57 or b >= 65 and b <= 90 or b >= 97 and b <= 122
         let mark = b == 45 or b == 46 or b == 33 or b == 37 or b == 42 or b == 95 or b == 43 or b == 96 or b == 39 or b == 126
         if not (alnum or mark)
             return false

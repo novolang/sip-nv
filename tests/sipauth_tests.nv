@@ -10,14 +10,15 @@
 use std.str
 use std.test
 use sipauth
-use siperr
 
 @test
 fn hash_functions_match_their_test_vectors()
     test.assert_eq(sipauth.hash_hex("MD5", "")!, "d41d8cd98f00b204e9800998ecf8427e")
     test.assert_eq(sipauth.hash_hex("md5", "abc")!, "900150983cd24fb0d6963f7d28e17f72")
-    test.assert_eq(sipauth.hash_hex("SHA-256", "abc")!, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
-    test.assert_eq(sipauth.hash_hex("SHA-512-256", "abc")!, "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23")
+    test.assert_eq(sipauth.hash_hex("SHA-256", "abc")!,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    test.assert_eq(sipauth.hash_hex("SHA-512-256", "abc")!,
+        "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23")
     test.assert_eq(sipauth.hash_hex("SHA-256-sess", "abc")!, sipauth.hash_hex("SHA-256", "abc")!)
     match sipauth.hash_hex("SHA-1", "abc")
         Ok(_)  => test.assert_eq(1, 2)
@@ -34,7 +35,8 @@ fn mufasa(alg: Str, qop: Str) -> Str
 fn the_responses_of_rfc_7616_section_3_9_1_are_reproduced()
     test.assert_eq(mufasa("MD5", "auth"), "8ca523f5e9506fed4657c9700eebdbec")
     test.assert_eq(mufasa("SHA-256", "auth"), "753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1")
-    test.assert_eq(mufasa("SHA-512-256", "auth"), "430d05014cecc49cab6fbe03176d41a1da86cbfe24a16580e22aaad928d960d0")
+    test.assert_eq(mufasa("SHA-512-256", "auth"),
+        "430d05014cecc49cab6fbe03176d41a1da86cbfe24a16580e22aaad928d960d0")
     // Without qop the nonce count and the cnonce are not in the digest (RFC 2069 form).
     test.assert_eq(mufasa("MD5", "") != mufasa("MD5", "auth"), true)
     // The -sess form differs from the plain one and is deterministic.
@@ -49,7 +51,8 @@ fn the_responses_of_rfc_7616_section_3_9_1_are_reproduced()
 
 @test
 fn challenges_are_read()
-    let c = sipauth.parse_challenge("Digest realm=\"atlanta.example\", nonce=\"84f1c1ae6cbe5ua9c\", opaque=\"5ccc069c403ebaf9f0171e9517f40e41\", algorithm=SHA-256, qop=\"auth, auth-int\", stale=TRUE", true)!
+    let c = sipauth.parse_challenge("Digest realm=\"atlanta.example\", nonce=\"84f1c1ae6cbe5ua9c\", opaque=\"5ccc069c403ebaf9f0171e9517f40e41\", algorithm=SHA-256, qop=\"auth, auth-int\", stale=TRUE",
+        true)!
     test.assert_eq(c.scheme, "Digest")
     test.assert_eq(c.realm, "atlanta.example")
     test.assert_eq(c.nonce, "84f1c1ae6cbe5ua9c")
@@ -73,7 +76,8 @@ fn challenges_are_read()
 
 @test
 fn a_challenge_is_answered_and_the_answer_is_checked()
-    let c = sipauth.parse_challenge("Digest realm=\"atlanta.example\", nonce=\"n1\", opaque=\"op\", algorithm=SHA-256, qop=\"auth\"", false)!
+    let c = sipauth.parse_challenge("Digest realm=\"atlanta.example\", nonce=\"n1\", opaque=\"op\", algorithm=SHA-256, qop=\"auth\"",
+        false)!
     let cr = sipauth.answer(c, "alice", "secret", "REGISTER", "sip:atlanta.example", "cn1", 3)!
     test.assert_eq(cr.qop, "auth")
     test.assert_eq(cr.nc, 3)

@@ -54,7 +54,8 @@ fn torture_wsinv()
     test.assert_eq(sipmsg.header_value(m, "Max-Forwards") ?? "-", "0068")
     test.assert_eq(sipmsg.cseq(m)!.seq, 9)
     test.assert_eq(sipmsg.cseq(m)!.method, "INVITE")
-    test.assert_eq(sipmsg.header_value(m, "NewFangledHeader") ?? "-", "newfangled value continued newfangled value")
+    test.assert_eq(sipmsg.header_value(m, "NewFangledHeader") ?? "-",
+        "newfangled value continued newfangled value")
     test.assert_eq(sipmsg.header_value(m, "UnknownHeaderWithUnusualValue") ?? "-", ";;,,;;,;")
     let from = sipmsg.from_addr(m)!
     test.assert_eq(from.display, "J Rosenberg \\\"")
@@ -102,7 +103,8 @@ fn torture_escnull()
     test.assert_eq(m.method, "REGISTER")
     test.assert_eq(sipstr.unescape(sipmsg.to_addr(m)!.uri.user), "null-\x00-null")
     test.assert_eq(list.len(sipmsg.header_values(m, "Contact")), 2)
-    test.assert_eq(sipstr.unescape(sipuri.parse_addr(sipmsg.header_values(m, "Contact")[1])!.uri.user), "\x00\x00")
+    test.assert_eq(sipstr.unescape(sipuri.parse_addr(sipmsg.header_values(m, "Contact")[1])!.uri.user),
+        "\x00\x00")
 
 // esc02, RFC 4475 section 3.1.1.5: Use of % When It Is Not an Escape.
 @test

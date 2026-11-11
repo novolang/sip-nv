@@ -6,8 +6,6 @@ use std.bytes
 use std.str
 use std.test
 use sdpmsg
-use sdpparse
-use sdpwrite
 use sipmsg
 use sipsdp
 
