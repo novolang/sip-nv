@@ -1,0 +1,404 @@
+// tests/sip4475_tests.nv — the SIP torture test messages of RFC 4475.
+//
+// RFC 4475 (SIP Torture Test Messages, May 2006) gives each message as text.
+// The messages below are the ones it names, taken from its text with the line
+// ends restored to CRLF and its notations expanded: `<allOneLine>` joins the
+// lines it holds, `<hex>` is the octets it spells and `<repeat count=N>` is
+// the text repeated N times.  Each test is named by the message's own name
+// and the section of the RFC it is in.
+//
+// A message that sections 3.1.1, 3.3 and 3.4 call valid must be read, and must
+// pass `validate`; a message that the RFC says should be refused must be
+// refused by `parse` or by `validate`.  Where the RFC says an element MAY read
+// the message (`escruri` and `bcast`) this package's choice is stated in the
+// test.  The two with extra spaces in the Request-Line (`lwsstart`, `trws`)
+// are among the refused, which the RFC allows.
+
+use std.bytes
+use std.str
+use std.test
+use sipmsg
+use sipstr
+use sipuri
+
+fn load(data: Str) -> SipMessage
+    sipmsg.parse(bytes.from_str(data))!
+
+fn valid(m: SipMessage) -> Bool
+    match sipmsg.validate(m)
+        Ok(_)  => true
+        Err(_) => false
+
+fn refused(data: Str) -> Bool
+    match sipmsg.parse(bytes.from_str(data))
+        Err(_) => true
+        Ok(m)  => not valid(m)
+
+// wsinv, RFC 4475 section 3.1.1.1: A Short Tortuous INVITE.
+@test
+fn torture_wsinv()
+    let m = load("INVITE sip:vivekg@chair-dnrc.example.com;unknownparam SIP/2.0\r\nTO :\r\n sip:vivekg@chair-dnrc.example.com ;   tag    = 1918181833n\r\nfrom   : \"J Rosenberg \\\\\\\"\"       <sip:jdrosen@example.com>\r\n  ;\r\n  tag = 98asjd8\r\nMaX-fOrWaRdS: 0068\r\nCall-ID: wsinv.ndaksdj@192.0.2.1\r\nContent-Length   : 150\r\ncseq: 0009\r\n  INVITE\r\nVia  : SIP  /   2.0\r\n /UDP\r\n    192.0.2.2;branch=390skdjuw\r\ns :\r\nNewFangledHeader:   newfangled value\r\n continued newfangled value\r\nUnknownHeaderWithUnusualValue: ;;,,;;,;\r\nContent-Type: application/sdp\r\nRoute:\r\n <sip:services.example.com;lr;unknownwith=value;unknown-no-value>\r\nv:  SIP  / 2.0  / TCP     spindle.example.com   ;\r\n  branch  =   z9hG4bK9ikj8  ,\r\n SIP  /    2.0   / UDP  192.168.255.111   ; branch=\r\n z9hG4bK30239\r\nm:\"Quoted string \\\"\\\"\" <sip:jdrosen@example.com> ; newparam =\r\n      newvalue ;\r\n  secondparam ; q = 0.33\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.3\r\ns=-\r\nc=IN IP4 192.0.2.4\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n")
+    test.assert(valid(m))
+    test.assert_eq(m.method, "INVITE")
+    test.assert_eq(m.uri, "sip:vivekg@chair-dnrc.example.com;unknownparam")
+    test.assert_eq(list.len(sipmsg.via_list(m)), 3)
+    test.assert_eq(sipmsg.via_list(m)[0].transport, "UDP")
+    test.assert_eq(sipmsg.via_list(m)[0].host, "192.0.2.2")
+    test.assert_eq(sipmsg.via_branch(sipmsg.via_list(m)[0]), "390skdjuw")
+    test.assert_eq(sipmsg.via_list(m)[1].transport, "TCP")
+    test.assert_eq(sipmsg.via_list(m)[1].host, "spindle.example.com")
+    test.assert_eq(sipmsg.via_branch(sipmsg.via_list(m)[1]), "z9hG4bK9ikj8")
+    test.assert_eq(sipmsg.via_list(m)[2].host, "192.168.255.111")
+    test.assert_eq(sipmsg.via_branch(sipmsg.via_list(m)[2]), "z9hG4bK30239")
+    test.assert_eq(sipmsg.header_value(m, "Subject") ?? "-", "")
+    test.assert_eq(sipmsg.header_value(m, "Max-Forwards") ?? "-", "0068")
+    test.assert_eq(sipmsg.cseq(m)!.seq, 9)
+    test.assert_eq(sipmsg.cseq(m)!.method, "INVITE")
+    test.assert_eq(sipmsg.header_value(m, "NewFangledHeader") ?? "-", "newfangled value continued newfangled value")
+    test.assert_eq(sipmsg.header_value(m, "UnknownHeaderWithUnusualValue") ?? "-", ";;,,;;,;")
+    let from = sipmsg.from_addr(m)!
+    test.assert_eq(from.display, "J Rosenberg \\\"")
+    test.assert_eq(sipuri.addr_tag(from), "98asjd8")
+    test.assert_eq(sipuri.addr_tag(sipmsg.to_addr(m)!), "1918181833n")
+    test.assert_eq(sipmsg.to_addr(m)!.uri.host, "chair-dnrc.example.com")
+    let contact = sipuri.parse_addr(sipmsg.header_value(m, "Contact") ?? "")!
+    test.assert_eq(contact.display, "Quoted string \"\"")
+    test.assert_eq(sipuri.find_param(contact.params, "newparam") ?? "-", "newvalue")
+    test.assert_eq(sipuri.find_param(contact.params, "q") ?? "-", "0.33")
+    test.assert_eq(sipuri.has_param(contact.params, "secondparam"), true)
+    test.assert_eq(bytes.len(m.body), 150)
+
+// intmeth, RFC 4475 section 3.1.1.2: Wide Range of Valid Characters.
+@test
+fn torture_intmeth()
+    let m = load("!interesting-Method0123456789_*+`.%indeed'~ sip:1_unusual.URI~(to-be!sure)&isn't+it\$/crazy?,/;;*:&it+has=1,weird!*pas\$wo~d_too.(doesn't-it)@example.com SIP/2.0\r\nVia: SIP/2.0/TCP host1.example.com;branch=z9hG4bK-.!%66*_+`'~\r\nTo: \"BEL:\\\x07 NUL:\\\x00 DEL:\\\x7f\" <sip:1_unusual.URI~(to-be!sure)&isn't+it\$/crazy?,/;;*@example.com>\r\nFrom: token1~` token2'+_ token3*%!.- <sip:mundane@example.com>;fromParam''~+*_!.-%=\"\xd1\x80\xd0\xb0\xd0\xb1\xd0\xbe\xd1\x82\xd0\xb0\xd1\x8e\xd1\x89\xd0\xb8\xd0\xb9\";tag=_token~1'+`*%!-.\r\nCall-ID: intmeth.word%ZK-!.*_+'@word`~)(><:\\/\"][?}{\r\nCSeq: 139122385 !interesting-Method0123456789_*+`.%indeed'~\r\nMax-Forwards: 255\r\nextensionHeader-!.%*+_`'~:\xef\xbb\xbf\xe5\xa4\xa7\xe5\x81\x9c\xe9\x9b\xbb\r\nContent-Length: 0\r\n\r\n")
+    test.assert(valid(m))
+    test.assert_eq(m.method, "!interesting-Method0123456789_*+`.%indeed'~")
+    test.assert_eq(sipmsg.cseq(m)!.seq, 139122385)
+    test.assert_eq(sipmsg.header_value(m, "Max-Forwards") ?? "-", "255")
+    test.assert_eq(list.len(sipmsg.via_list(m)), 1)
+    test.assert_eq(sipmsg.via_list(m)[0].transport, "TCP")
+
+// esc01, RFC 4475 section 3.1.1.3: Valid Use of the % Escaping Mechanism.
+@test
+fn torture_esc01()
+    let m = load("INVITE sip:sips%3Auser%40example.com@example.net SIP/2.0\r\nTo: sip:%75se%72@example.com\r\nFrom: <sip:I%20have%20spaces@example.net>;tag=938\r\nMax-Forwards: 87\r\ni: esc01.239409asdfakjkn23onasd0-3234\r\nCSeq: 234234 INVITE\r\nVia: SIP/2.0/UDP host5.example.net;branch=z9hG4bKkdjuw\r\nC: application/sdp\r\nContact:\r\n  <sip:cal%6Cer@host5.example.net;%6C%72;n%61me=v%61lue%25%34%31>\r\nContent-Length: 150\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n")
+    test.assert(valid(m))
+    let to = sipmsg.to_addr(m)!
+    let plain = sipuri.parse("sip:user@example.com")!
+    test.assert_eq(sipuri.equal(to.uri, plain), true)
+    test.assert_eq(sipuri.parse(m.uri)!.user, "sips%3Auser%40example.com")
+    let from = sipmsg.from_addr(m)!
+    test.assert_eq(sipstr.unescape(from.uri.user), "I have spaces")
+    let contact = sipuri.parse_addr(sipmsg.header_value(m, "Contact") ?? "")!
+    test.assert_eq(sipstr.unescape(contact.uri.user), "caller")
+    test.assert_eq(bytes.len(m.body), 150)
+
+// escnull, RFC 4475 section 3.1.1.4: Escaped Nulls in URIs.
+@test
+fn torture_escnull()
+    let m = load("REGISTER sip:example.com SIP/2.0\r\nTo: sip:null-%00-null@example.com\r\nFrom: sip:null-%00-null@example.com;tag=839923423\r\nMax-Forwards: 70\r\nCall-ID: escnull.39203ndfvkjdasfkq3w4otrq0adsfdfnavd\r\nCSeq: 14398234 REGISTER\r\nVia: SIP/2.0/UDP host5.example.com;branch=z9hG4bKkdjuw\r\nContact: <sip:%00@host5.example.com>\r\nContact: <sip:%00%00@host5.example.com>\r\nL:0\r\n\r\n")
+    test.assert(valid(m))
+    test.assert_eq(m.method, "REGISTER")
+    test.assert_eq(sipstr.unescape(sipmsg.to_addr(m)!.uri.user), "null-\x00-null")
+    test.assert_eq(list.len(sipmsg.header_values(m, "Contact")), 2)
+    test.assert_eq(sipstr.unescape(sipuri.parse_addr(sipmsg.header_values(m, "Contact")[1])!.uri.user), "\x00\x00")
+
+// esc02, RFC 4475 section 3.1.1.5: Use of % When It Is Not an Escape.
+@test
+fn torture_esc02()
+    let m = load("RE%47IST%45R sip:registrar.example.com SIP/2.0\r\nTo: \"%Z%45\" <sip:resource@example.com>\r\nFrom: \"%Z%45\" <sip:resource@example.com>;tag=f232jadfj23\r\nCall-ID: esc02.asdfnqwo34rq23i34jrjasdcnl23nrlknsdf\r\nVia: SIP/2.0/TCP host.example.com;branch=z9hG4bK209%fzsnel234\r\nCSeq: 29344 RE%47IST%45R\r\nMax-Forwards: 70\r\nContact: <sip:alias1@host1.example.com>\r\nC%6Fntact: <sip:alias2@host2.example.com>\r\nContact: <sip:alias3@host3.example.com>\r\nl: 0\r\n\r\n")
+    test.assert(valid(m))
+    test.assert_eq(m.method, "RE%47IST%45R")
+    test.assert_eq(sipmsg.to_addr(m)!.display, "%Z%45")
+    test.assert_eq(list.len(sipmsg.header_values(m, "Contact")), 2)
+    test.assert_eq(list.len(sipmsg.header_values(m, "C%6Fntact")), 1)
+
+// lwsdisp, RFC 4475 section 3.1.1.6: Message with No LWS between Display Name and <.
+@test
+fn torture_lwsdisp()
+    let m = load("OPTIONS sip:user@example.com SIP/2.0\r\nTo: sip:user@example.com\r\nFrom: caller<sip:caller@example.com>;tag=323\r\nMax-Forwards: 70\r\nCall-ID: lwsdisp.1234abcd@funky.example.com\r\nCSeq: 60 OPTIONS\r\nVia: SIP/2.0/UDP funky.example.com;branch=z9hG4bKkdjuw\r\nl: 0\r\n\r\n")
+    test.assert(valid(m))
+    test.assert_eq(sipmsg.from_addr(m)!.display, "caller")
+    test.assert_eq(sipmsg.from_addr(m)!.uri.host, "example.com")
+
+// longreq, RFC 4475 section 3.1.1.7: Long Values in Header Fields.
+@test
+fn torture_longreq()
+    let m = load("INVITE sip:user@example.com SIP/2.0\r\nTo: \"I have a user name of extremeextremeextremeextremeextremeextremeextremeextremeextremeextreme proportion\"<sip:user@example.com:6000;unknownparam1=verylonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglongvalue;longparamnamenamenamenamenamenamenamenamenamenamenamenamenamenamenamenamenamenamenamenamenamenamenamenamename=shortvalue;verylonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglongParameterNameWithNoValue>\r\nF: sip:amazinglylongcallernameamazinglylongcallernameamazinglylongcallernameamazinglylongcallernameamazinglylongcallername@example.net;tag=12982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982982424;unknownheaderparamnamenamenamenamenamenamenamenamenamenamenamenamenamenamenamenamenamenamenamename=unknowheaderparamvaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevalue;unknownValuelessparamnameparamnameparamnameparamnameparamnameparamnameparamnameparamnameparamnameparamname\r\nCall-ID: longreq.onereallyreallyreallyreallyreallyreallyreallyreallyreallyreallyreallyreallyreallyreallyreallyreallyreallyreallyreallyreallylongcallid\r\nCSeq: 3882340 INVITE\r\nUnknown-LongLongLongLongLongLongLongLongLongLongLongLongLongLongLongLongLongLongLongLong-Name: unknown-longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong-value; unknown-longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong-parameter-name = unknown-longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong-parameter-value\r\nVia: SIP/2.0/TCP sip33.example.com\r\nv: SIP/2.0/TCP sip32.example.com\r\nV: SIP/2.0/TCP sip31.example.com\r\nVia: SIP/2.0/TCP sip30.example.com\r\nViA: SIP/2.0/TCP sip29.example.com\r\nVIa: SIP/2.0/TCP sip28.example.com\r\nVIA: SIP/2.0/TCP sip27.example.com\r\nvia: SIP/2.0/TCP sip26.example.com\r\nviA: SIP/2.0/TCP sip25.example.com\r\nvIa: SIP/2.0/TCP sip24.example.com\r\nvIA: SIP/2.0/TCP sip23.example.com\r\nV :  SIP/2.0/TCP sip22.example.com\r\nv :  SIP/2.0/TCP sip21.example.com\r\nV  : SIP/2.0/TCP sip20.example.com\r\nv  : SIP/2.0/TCP sip19.example.com\r\nVia : SIP/2.0/TCP sip18.example.com\r\nVia  : SIP/2.0/TCP sip17.example.com\r\nVia: SIP/2.0/TCP sip16.example.com\r\nVia: SIP/2.0/TCP sip15.example.com\r\nVia: SIP/2.0/TCP sip14.example.com\r\nVia: SIP/2.0/TCP sip13.example.com\r\nVia: SIP/2.0/TCP sip12.example.com\r\nVia: SIP/2.0/TCP sip11.example.com\r\nVia: SIP/2.0/TCP sip10.example.com\r\nVia: SIP/2.0/TCP sip9.example.com\r\nVia: SIP/2.0/TCP sip8.example.com\r\nVia: SIP/2.0/TCP sip7.example.com\r\nVia: SIP/2.0/TCP sip6.example.com\r\nVia: SIP/2.0/TCP sip5.example.com\r\nVia: SIP/2.0/TCP sip4.example.com\r\nVia: SIP/2.0/TCP sip3.example.com\r\nVia: SIP/2.0/TCP sip2.example.com\r\nVia: SIP/2.0/TCP sip1.example.com\r\nVia: SIP/2.0/TCP host.example.com;received=192.0.2.5;branch=verylonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglongbranchvalue\r\nMax-Forwards: 70\r\nContact: <sip:amazinglylongcallernameamazinglylongcallernameamazinglylongcallernameamazinglylongcallernameamazinglylongcallername@host5.example.net>\r\nContent-Type: application/sdp\r\nl: 150\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n")
+    test.assert(valid(m))
+    test.assert_eq(m.method, "INVITE")
+    test.assert_eq(str.len(sipmsg.call_id(m)) > 100, true)
+
+// dblreq, RFC 4475 section 3.1.1.8: Extra Trailing Octets in a UDP Datagram.
+@test
+fn torture_dblreq()
+    let m = load("REGISTER sip:example.com SIP/2.0\r\nTo: sip:j.user@example.com\r\nFrom: sip:j.user@example.com;tag=43251j3j324\r\nMax-Forwards: 8\r\nI: dblreq.0ha0isndaksdj99sdfafnl3lk233412\r\nContact: sip:j.user@host.example.com\r\nCSeq: 8 REGISTER\r\nVia: SIP/2.0/UDP 192.0.2.125;branch=z9hG4bKkdjuw23492\r\nContent-Length: 0\r\n\r\nINVITE sip:joe@example.com SIP/2.0\r\nt: sip:joe@example.com\r\nFrom: sip:caller@example.net;tag=141334\r\nMax-Forwards: 8\r\nCall-ID: dblreq.0ha0isnda977644900765@192.0.2.15\r\nCSeq: 8 INVITE\r\nVia: SIP/2.0/UDP 192.0.2.15;branch=z9hG4bKkdjuw380234\r\nContent-Type: application/sdp\r\nContent-Length: 150\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.15\r\ns=-\r\nc=IN IP4 192.0.2.15\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm =video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n")
+    test.assert(valid(m))
+    test.assert_eq(m.method, "REGISTER")
+    test.assert_eq(bytes.len(m.body), 0)
+
+// semiuri, RFC 4475 section 3.1.1.9: Semicolon-Separated Parameters in URI User Part.
+@test
+fn torture_semiuri()
+    let m = load("OPTIONS sip:user;par=u%40example.net@example.com SIP/2.0\r\nTo: sip:j_user@example.com\r\nFrom: sip:caller@example.org;tag=33242\r\nMax-Forwards: 3\r\nCall-ID: semiuri.0ha0isndaksdj\r\nCSeq: 8 OPTIONS\r\nAccept: application/sdp, application/pkcs7-mime,\r\n        multipart/mixed, multipart/signed,\r\n        message/sip, message/sipfrag\r\nVia: SIP/2.0/UDP 192.0.2.1;branch=z9hG4bKkdjuw\r\nl: 0\r\n\r\n")
+    test.assert(valid(m))
+    test.assert_eq(m.uri, "sip:user;par=u%40example.net@example.com")
+    test.assert_eq(sipuri.parse(m.uri)!.user, "user;par=u%40example.net")
+    test.assert_eq(sipuri.parse(m.uri)!.host, "example.com")
+    test.assert_eq(list.len(sipmsg.header_values(m, "Accept")), 6)
+
+// transports, RFC 4475 section 3.1.1.10: Varied and Unknown Transport Types.
+@test
+fn torture_transports()
+    let m = load("OPTIONS sip:user@example.com SIP/2.0\r\nTo: sip:user@example.com\r\nFrom: <sip:caller@example.com>;tag=323\r\nMax-Forwards: 70\r\nCall-ID:  transports.kijh4akdnaqjkwendsasfdj\r\nAccept: application/sdp\r\nCSeq: 60 OPTIONS\r\nVia: SIP/2.0/UDP t1.example.com;branch=z9hG4bKkdjuw\r\nVia: SIP/2.0/SCTP t2.example.com;branch=z9hG4bKklasjdhf\r\nVia: SIP/2.0/TLS t3.example.com;branch=z9hG4bK2980unddj\r\nVia: SIP/2.0/UNKNOWN t4.example.com;branch=z9hG4bKasd0f3en\r\nVia: SIP/2.0/TCP t5.example.com;branch=z9hG4bK0a9idfnee\r\nl: 0\r\n\r\n")
+    test.assert(valid(m))
+    test.assert_eq(list.len(sipmsg.via_list(m)), 5)
+    test.assert_eq(sipmsg.via_list(m)[1].transport, "SCTP")
+    test.assert_eq(sipmsg.via_list(m)[2].transport, "TLS")
+    test.assert_eq(sipmsg.via_list(m)[3].transport, "UNKNOWN")
+    test.assert_eq(sipmsg.via_list(m)[4].transport, "TCP")
+
+// mpart01, RFC 4475 section 3.1.1.11: Multipart MIME Message.
+@test
+fn torture_mpart01()
+    let m = load("MESSAGE sip:kumiko@example.org SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:5070;branch=z9hG4bK-d87543-4dade06d0bdb11ee-1--d87543-;rport\r\nMax-Forwards: 70\r\nRoute: <sip:127.0.0.1:5080>\r\nIdentity: r5mwreLuyDRYBi/0TiPwEsY3rEVsk/G2WxhgTV1PF7hHuLIK0YWVKZhKv9Mj8UeXqkMVbnVq37CD+813gvYjcBUaZngQmXc9WNZSDNGCzA+fWl9MEUHWIZo1CeJebdY/XlgKeTa0Olvq0rt70Q5jiSfbqMJmQFteeivUhkMWYUA=\r\nContact: <sip:fluffy@127.0.0.1:5070>\r\nTo: <sip:kumiko@example.org>\r\nFrom: <sip:fluffy@example.com>;tag=2fb0dcc9\r\nCall-ID: 3d9485ad0c49859b@Zmx1ZmZ5LW1hYy0xNi5sb2NhbA..\r\nCSeq: 1 MESSAGE\r\nContent-Transfer-Encoding: binary\r\nContent-Type: multipart/mixed;boundary=7a9cbec02ceef655\r\nDate: Sat, 15 Oct 2005 04:44:56 GMT\r\nUser-Agent: SIPimp.org/0.2.5 (curses)\r\nContent-Length: 553\r\n\r\n--7a9cbec02ceef655\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: binary\r\n\r\nHello\r\n--7a9cbec02ceef655\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: binary\r\n0\x82\x01R\x06\t*\x86H\x86\xf7\r\x01\x07\x02\xa0\x82\x01C0\x82\x01?\x02\x01\x011\t0\x07\x06\x05+\x0e\x03\x02\x1a0\x0b\x06\t*\x86H\x86\xf7\r\x01\x07\x011\x82\x01 0\x82\x01\x1c\x02\x01\x010|0p1\x0b0\t\x06\x03U\x04\x06\x13\x02US1\x130\x11\x06\x03U\x04\x08\x13\r\nCalifornia1\x110\x0f\x06\x03U\x04\x07\x13\x08San Jose1\x0e0\x0c\x06\x03U\x04\r\n\x13\x05sipit1)0'\x06\x03U\x04\x0b\x13 Sipit Test Certificate Authority\x02\x08\x01\x95\x00q\x023\x01\x130\x07\x06\x05+\x0e\x03\x02\x1a0\r\x06\t*\x86H\x86\xf7\r\x01\x01\x01\x05\x00\x04\x81\x80\x8e\xf4f\xf9H\xf0R-\xd2\xe5\x97\x8e\x9d\x95\xaa\xe9\xf2\xfe\x15\xa0fYqb\x92\xe8\xda*\xa8\xd85\r\nh\xce\xff\xae<\xbd+\xff\x16u\xdd\xd5d\x8eY=\xd6G(\xf2b \xf7\xe9At\x9e3\r\x9a\x15\xed\xab\xdb\x93\xd1\x0cB\x10.{r\x89\xd2\x9c\xc0\xc9\xae.\xfb\xc7\xc0\xcf\xf9\x17/;\x02~O\xc0'\xe1Tm\xe4\xb6\xaa:\xbb>f\xcc\xcb]\xd6\xc6K\x83\x83\x14\x9c\xb8\xe6\xff\x18-\x94O\xe5{e\xbc\x99\xd0\x05\r\n--7a9cbec02ceef655--\r\n")
+    test.assert(valid(m))
+    test.assert_eq(str.contains(sipmsg.header_value(m, "Content-Type") ?? "", "multipart/mixed"), true)
+
+// unreason, RFC 4475 section 3.1.1.12: Unusual Reason Phrase.
+@test
+fn torture_unreason()
+    let m = load("SIP/2.0 200 = 2**3 * 5**2 \xd0\xbd\xd0\xbe \xd1\x81\xd1\x82\xd0\xbe \xd0\xb4\xd0\xb5\xd0\xb2\xd1\x8f\xd0\xbd\xd0\xbe\xd1\x81\xd1\x82\xd0\xbe \xd0\xb4\xd0\xb5\xd0\xb2\xd1\x8f\xd1\x82\xd1\x8c - \xd0\xbf\xd1\x80\xd0\xbe\xd1\x81\xd1\x82\xd0\xbe\xd0\xb5\r\nVia: SIP/2.0/UDP 192.0.2.198;branch=z9hG4bK1324923\r\nCall-ID: unreason.1234ksdfak3j2erwedfsASdf\r\nCSeq: 35 INVITE\r\nFrom: sip:user@example.com;tag=11141343\r\nTo: sip:user@example.edu;tag=2229\r\nContent-Length: 154\r\nContent-Type: application/sdp\r\nContact: <sip:user@host198.example.com>\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.198\r\ns=-\r\nc=IN IP4 192.0.2.198\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n")
+    test.assert(valid(m))
+    test.assert_eq(m.is_request, false)
+    test.assert_eq(m.status, 200)
+    test.assert_eq(str.starts_with(m.reason, "= 2**3 * 5**2 "), true)
+    test.assert_eq(str.len(m.reason), 74)
+
+// noreason, RFC 4475 section 3.1.1.13: Empty Reason Phrase.
+@test
+fn torture_noreason()
+    let m = load("SIP/2.0 100 \r\nVia: SIP/2.0/UDP 192.0.2.105;branch=z9hG4bK2398ndaoe\r\nCall-ID: noreason.asndj203insdf99223ndf\r\nCSeq: 35 INVITE\r\nFrom: <sip:user@example.com>;tag=39ansfi3\r\nTo: <sip:user@example.edu>;tag=902jndnke3\r\nContent-Length: 0\r\nContact: <sip:user@host105.example.com>\r\n\r\n")
+    test.assert(valid(m))
+    test.assert_eq(m.status, 100)
+    test.assert_eq(m.reason, "")
+
+// unkscm, RFC 4475 section 3.3.2: Request-URI with Unknown Scheme.
+@test
+fn torture_unkscm()
+    let m = load("OPTIONS nobodyKnowsThisScheme:totallyopaquecontent SIP/2.0\r\nTo: sip:user@example.com\r\nFrom: sip:caller@example.net;tag=384\r\nMax-Forwards: 3\r\nCall-ID: unkscm.nasdfasser0q239nwsdfasdkl34\r\nCSeq: 3923423 OPTIONS\r\nVia: SIP/2.0/TCP host9.example.com;branch=z9hG4bKkdjuw39234\r\nContent-Length: 0\r\n\r\n")
+    test.assert(valid(m))
+    test.assert_eq(sipuri.parse(m.uri)!.scheme, "nobodyknowsthisscheme")
+    test.assert_eq(sipuri.parse(m.uri)!.opaque, "totallyopaquecontent")
+
+// novelsc, RFC 4475 section 3.3.3: Request-URI with Known but Atypical Scheme.
+@test
+fn torture_novelsc()
+    let m = load("OPTIONS soap.beep://192.0.2.103:3002 SIP/2.0\r\nTo: sip:user@example.com\r\nFrom: sip:caller@example.net;tag=384\r\nMax-Forwards: 3\r\nCall-ID: novelsc.asdfasser0q239nwsdfasdkl34\r\nCSeq: 3923423 OPTIONS\r\nVia: SIP/2.0/TCP host9.example.com;branch=z9hG4bKkdjuw39234\r\nContent-Length: 0\r\n\r\n")
+    test.assert(valid(m))
+    test.assert_eq(sipuri.parse(m.uri)!.scheme, "soap.beep")
+
+// unksm2, RFC 4475 section 3.3.4: Unknown URI Schemes in Header Fields.
+@test
+fn torture_unksm2()
+    let m = load("REGISTER sip:example.com SIP/2.0\r\nTo: isbn:2983792873\r\nFrom: <http://www.example.com>;tag=3234233\r\nCall-ID: unksm2.daksdj@hyphenated-host.example.com\r\nCSeq: 234902 REGISTER\r\nMax-Forwards: 70\r\nVia: SIP/2.0/UDP 192.0.2.21:5060;branch=z9hG4bKkdjuw\r\nContact: <name:John_Smith>\r\nl: 0\r\n\r\n")
+    test.assert(valid(m))
+    test.assert_eq(sipmsg.to_addr(m)!.uri.scheme, "isbn")
+    test.assert_eq(sipmsg.from_addr(m)!.uri.scheme, "http")
+    test.assert_eq(sipuri.parse_addr(sipmsg.header_value(m, "Contact") ?? "")!.uri.scheme, "name")
+
+// bext01, RFC 4475 section 3.3.5: Proxy-Require and Require.
+@test
+fn torture_bext01()
+    let m = load("OPTIONS sip:user@example.com SIP/2.0\r\nTo: sip:j_user@example.com\r\nFrom: sip:caller@example.net;tag=242etr\r\nMax-Forwards: 6\r\nCall-ID: bext01.0ha0isndaksdj\r\nRequire: nothingSupportsThis, nothingSupportsThisEither\r\nProxy-Require: noProxiesSupportThis, norDoAnyProxiesSupportThis\r\nCSeq: 8 OPTIONS\r\nVia: SIP/2.0/TLS fold-and-staple.example.com;branch=z9hG4bKkdjuw\r\nContent-Length: 0\r\n\r\n")
+    test.assert(valid(m))
+    test.assert_eq(list.len(sipmsg.header_values(m, "Require")), 2)
+    test.assert_eq(sipmsg.header_values(m, "Proxy-Require")[1], "norDoAnyProxiesSupportThis")
+
+// invut, RFC 4475 section 3.3.6: Unknown Content-Type.
+@test
+fn torture_invut()
+    let m = load("INVITE sip:user@example.com SIP/2.0\r\nContact: <sip:caller@host5.example.net>\r\nTo: sip:j.user@example.com\r\nFrom: sip:caller@example.net;tag=8392034\r\nMax-Forwards: 70\r\nCall-ID: invut.0ha0isndaksdjadsfij34n23d\r\nCSeq: 235448 INVITE\r\nVia: SIP/2.0/UDP somehost.example.com;branch=z9hG4bKkdjuw\r\nContent-Type: application/unknownformat\r\nContent-Length: 40\r\n\r\n<audio>\r\n <pcmu port=\"443\"/>\r\n</audio>\r\n")
+    test.assert(valid(m))
+    test.assert_eq(sipmsg.header_value(m, "Content-Type") ?? "-", "application/unknownformat")
+    test.assert_eq(bytes.len(m.body), 40)
+
+// regaut01, RFC 4475 section 3.3.7: Unknown Authorization Scheme.
+@test
+fn torture_regaut01()
+    let m = load("REGISTER sip:example.com SIP/2.0\r\nTo: sip:j.user@example.com\r\nFrom: sip:j.user@example.com;tag=87321hj23128\r\nMax-Forwards: 8\r\nCall-ID: regaut01.0ha0isndaksdj\r\nCSeq: 9338 REGISTER\r\nVia: SIP/2.0/TCP 192.0.2.253;branch=z9hG4bKkdjuw\r\nAuthorization: NoOneKnowsThisScheme opaque-data=here\r\nContent-Length:0\r\n\r\n")
+    test.assert(valid(m))
+    test.assert_eq(sipmsg.header_value(m, "Authorization") ?? "-", "NoOneKnowsThisScheme opaque-data=here")
+
+// zeromf, RFC 4475 section 3.3.11: Max-Forwards of Zero.
+@test
+fn torture_zeromf()
+    let m = load("OPTIONS sip:user@example.com SIP/2.0\r\nTo: sip:user@example.com\r\nFrom: sip:caller@example.net;tag=3ghsd41\r\nCall-ID: zeromf.jfasdlfnm2o2l43r5u0asdfas\r\nCSeq: 39234321 OPTIONS\r\nVia: SIP/2.0/UDP host1.example.com;branch=z9hG4bKkdjuw2349i\r\nMax-Forwards: 0\r\nContent-Length: 0\r\n\r\n")
+    test.assert(valid(m))
+    test.assert_eq(sipmsg.header_value(m, "Max-Forwards") ?? "-", "0")
+
+// cparam01, RFC 4475 section 3.3.12: REGISTER with a Contact Header Parameter.
+@test
+fn torture_cparam01()
+    let m = load("REGISTER sip:example.com SIP/2.0\r\nVia: SIP/2.0/UDP saturn.example.com:5060;branch=z9hG4bKkdjuw\r\nMax-Forwards: 70\r\nFrom: sip:watson@example.com;tag=DkfVgjkrtMwaerKKpe\r\nTo: sip:watson@example.com\r\nCall-ID: cparam01.70710@saturn.example.com\r\nCSeq: 2 REGISTER\r\nContact: sip:+19725552222@gw1.example.net;unknownparam\r\nl: 0\r\n\r\n")
+    test.assert(valid(m))
+    let c = sipuri.parse_addr(sipmsg.header_value(m, "Contact") ?? "")!
+    test.assert_eq(sipuri.has_param(c.params, "unknownparam"), true)
+    test.assert_eq(sipuri.has_param(c.uri.params, "unknownparam"), false)
+
+// cparam02, RFC 4475 section 3.3.13: REGISTER with a url-parameter.
+@test
+fn torture_cparam02()
+    let m = load("REGISTER sip:example.com SIP/2.0\r\nVia: SIP/2.0/UDP saturn.example.com:5060;branch=z9hG4bKkdjuw\r\nMax-Forwards: 70\r\nFrom: sip:watson@example.com;tag=838293\r\nTo: sip:watson@example.com\r\nCall-ID: cparam02.70710@saturn.example.com\r\nCSeq: 3 REGISTER\r\nContact: <sip:+19725552222@gw1.example.net;unknownparam>\r\nl: 0\r\n\r\n")
+    test.assert(valid(m))
+    let c = sipuri.parse_addr(sipmsg.header_value(m, "Contact") ?? "")!
+    test.assert_eq(sipuri.has_param(c.params, "unknownparam"), false)
+    test.assert_eq(sipuri.has_param(c.uri.params, "unknownparam"), true)
+
+// regescrt, RFC 4475 section 3.3.14: REGISTER with a URL Escaped Header.
+@test
+fn torture_regescrt()
+    let m = load("REGISTER sip:example.com SIP/2.0\r\nTo: sip:user@example.com\r\nFrom: sip:user@example.com;tag=8\r\nMax-Forwards: 70\r\nCall-ID: regescrt.k345asrl3fdbv@192.0.2.1\r\nCSeq: 14398234 REGISTER\r\nVia: SIP/2.0/UDP host5.example.com;branch=z9hG4bKkdjuw\r\nM: <sip:user@example.com?Route=%3Csip:sip.example.com%3E>\r\nL:0\r\n\r\n")
+    test.assert(valid(m))
+    let c = sipuri.parse_addr(sipmsg.header_value(m, "Contact") ?? "")!
+    test.assert_eq(c.uri.headers[0].name, "Route")
+    test.assert_eq(c.uri.headers[0].value, "%3Csip:sip.example.com%3E")
+
+// sdp01, RFC 4475 section 3.3.15: Unacceptable Accept Offering.
+@test
+fn torture_sdp01()
+    let m = load("INVITE sip:user@example.com SIP/2.0\r\nTo: sip:j_user@example.com\r\nContact: <sip:caller@host15.example.net>\r\nFrom: sip:caller@example.net;tag=234\r\nMax-Forwards: 5\r\nCall-ID: sdp01.ndaksdj9342dasdd\r\nAccept: text/nobodyKnowsThis\r\nCSeq: 8 INVITE\r\nVia: SIP/2.0/UDP 192.0.2.15;branch=z9hG4bKkdjuw\r\nContent-Length: 150\r\nContent-Type: application/sdp\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.5\r\ns=-\r\nc=IN IP4 192.0.2.5\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n")
+    test.assert(valid(m))
+    test.assert_eq(sipmsg.header_value(m, "Accept") ?? "-", "text/nobodyKnowsThis")
+    test.assert_eq(bytes.len(m.body), 150)
+
+// inv2543, RFC 4475 section 3.4.1: INVITE with RFC 2543 Syntax.
+@test
+fn torture_inv2543()
+    let m = load("INVITE sip:UserB@example.com SIP/2.0\r\nVia: SIP/2.0/UDP iftgw.example.com\r\nFrom: <sip:+13035551111@ift.client.example.net;user=phone>\r\nRecord-Route: <sip:UserB@example.com;maddr=ss1.example.com>\r\nTo: sip:+16505552222@ss1.example.net;user=phone\r\nCall-ID: inv2543.1717@ift.client.example.com\r\nCSeq: 56 INVITE\r\nContent-Type: application/sdp\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.5\r\ns=-\r\nc=IN IP4 192.0.2.5\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0\r\n")
+    test.assert(valid(m))
+    test.assert_eq(sipmsg.via_branch(sipmsg.via_list(m)[0]), "")
+    test.assert_eq(sipmsg.has_header(m, "Max-Forwards"), false)
+
+// badinv01, RFC 4475 section 3.1.2.1: Extraneous Header Field Separators.
+@test
+fn torture_badinv01_is_refused()
+    test.assert(refused("INVITE sip:user@example.com SIP/2.0\r\nTo: sip:j.user@example.com\r\nFrom: sip:caller@example.net;tag=134161461246\r\nMax-Forwards: 7\r\nCall-ID: badinv01.0ha0isndaksdjasdf3234nas\r\nCSeq: 8 INVITE\r\nVia: SIP/2.0/UDP 192.0.2.15;;,;,,\r\nContact: \"Joe\" <sip:joe@example.org>;;;;\r\nContent-Length: 152\r\nContent-Type: application/sdp\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.15\r\ns=-\r\nc=IN IP4 192.0.2.15\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n"))
+
+// clerr, RFC 4475 section 3.1.2.2: Content Length Larger Than Message.
+@test
+fn torture_clerr_is_refused()
+    test.assert(refused("INVITE sip:user@example.com SIP/2.0\r\nMax-Forwards: 80\r\nTo: sip:j.user@example.com\r\nFrom: sip:caller@example.net;tag=93942939o2\r\nContact: <sip:caller@hungry.example.net>\r\nCall-ID: clerr.0ha0isndaksdjweiafasdk3\r\nCSeq: 8 INVITE\r\nVia: SIP/2.0/UDP host5.example.com;branch=z9hG4bK-39234-23523\r\nContent-Type: application/sdp\r\nContent-Length: 9999\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.155\r\ns=-\r\nc=IN IP4 192.0.2.155\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n"))
+
+// ncl, RFC 4475 section 3.1.2.3: Negative Content-Length.
+@test
+fn torture_ncl_is_refused()
+    test.assert(refused("INVITE sip:user@example.com SIP/2.0\r\nMax-Forwards: 254\r\nTo: sip:j.user@example.com\r\nFrom: sip:caller@example.net;tag=32394234\r\nCall-ID: ncl.0ha0isndaksdj2193423r542w35\r\nCSeq: 0 INVITE\r\nVia: SIP/2.0/UDP 192.0.2.53;branch=z9hG4bKkdjuw\r\nContact: <sip:caller@example53.example.net>\r\nContent-Type: application/sdp\r\nContent-Length: -999\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.53\r\ns=-\r\nc=IN IP4 192.0.2.53\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n"))
+
+// scalar02, RFC 4475 section 3.1.2.4: Request Scalar Fields with Overlarge Values.
+@test
+fn torture_scalar02_is_refused()
+    test.assert(refused("REGISTER sip:example.com SIP/2.0\r\nVia: SIP/2.0/TCP host129.example.com;branch=z9hG4bK342sdfoi3\r\nTo: <sip:user@example.com>\r\nFrom: <sip:user@example.com>;tag=239232jh3\r\nCSeq: 36893488147419103232 REGISTER\r\nCall-ID: scalar02.23o0pd9vanlq3wnrlnewofjas9ui32\r\nMax-Forwards: 300\r\nExpires: 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\r\nContact: <sip:user@host129.example.com>\r\n  ;expires=280297596632815\r\nContent-Length: 0\r\n\r\n"))
+
+// scalarlg, RFC 4475 section 3.1.2.5: Response Scalar Fields with Overlarge Values.
+@test
+fn torture_scalarlg_is_refused()
+    test.assert(refused("SIP/2.0 503 Service Unavailable\r\nVia: SIP/2.0/TCP host129.example.com;branch=z9hG4bKzzxdiwo34sw;received=192.0.2.129\r\nTo: <sip:user@example.com>\r\nFrom: <sip:other@example.net>;tag=2easdjfejw\r\nCSeq: 9292394834772304023312 OPTIONS\r\nCall-ID: scalarlg.noase0of0234hn2qofoaf0232aewf2394r\r\nRetry-After: 949302838503028349304023988\r\nWarning: 1812 overture \"In Progress\"\r\nContent-Length: 0\r\n\r\n"))
+
+// quotbal, RFC 4475 section 3.1.2.6: Unterminated Quoted String in Display Name.
+@test
+fn torture_quotbal_is_refused()
+    test.assert(refused("INVITE sip:user@example.com SIP/2.0\r\nTo: \"Mr. J. User <sip:j.user@example.com>\r\nFrom: sip:caller@example.net;tag=93334\r\nMax-Forwards: 10\r\nCall-ID: quotbal.aksdj\r\nContact: <sip:caller@host59.example.net>\r\nCSeq: 8 INVITE\r\nVia: SIP/2.0/UDP 192.0.2.59:5050;branch=z9hG4bKkdjuw39234\r\nContent-Type: application/sdp\r\nContent-Length: 152\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.15\r\ns=-\r\nc=IN IP4 192.0.2.15\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n"))
+
+// ltgtruri, RFC 4475 section 3.1.2.7: <> Enclosing Request-URI.
+@test
+fn torture_ltgtruri_is_refused()
+    test.assert(refused("INVITE <sip:user@example.com> SIP/2.0\r\nTo: sip:user@example.com\r\nFrom: sip:caller@example.net;tag=39291\r\nMax-Forwards: 23\r\nCall-ID: ltgtruri.1@192.0.2.5\r\nCSeq: 1 INVITE\r\nVia: SIP/2.0/UDP 192.0.2.5\r\nContact: <sip:caller@host5.example.net>\r\nContent-Type: application/sdp\r\nContent-Length: 159\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.5\r\ns=-\r\nc=IN IP4 192.0.2.5\r\nt=3149328700 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n"))
+
+// lwsruri, RFC 4475 section 3.1.2.8: Malformed SIP Request-URI (embedded LWS).
+@test
+fn torture_lwsruri_is_refused()
+    test.assert(refused("INVITE sip:user@example.com; lr SIP/2.0\r\nTo: sip:user@example.com;tag=3xfe-9921883-z9f\r\nFrom: sip:caller@example.net;tag=231413434\r\nMax-Forwards: 5\r\nCall-ID: lwsruri.asdfasdoeoi2323-asdfwrn23-asd834rk423\r\nCSeq: 2130706432 INVITE\r\nVia: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKkdjuw2395\r\nContact: <sip:caller@host1.example.net>\r\nContent-Type: application/sdp\r\nContent-Length: 159\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=3149328700 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n"))
+
+// lwsstart, RFC 4475 section 3.1.2.9: Multiple SP Separating Request-Line Elements.
+@test
+fn torture_lwsstart_is_refused()
+    test.assert(refused("INVITE  sip:user@example.com  SIP/2.0\r\nMax-Forwards: 8\r\nTo: sip:user@example.com\r\nFrom: sip:caller@example.net;tag=8814\r\nCall-ID: lwsstart.dfknq234oi243099adsdfnawe3@example.com\r\nCSeq: 1893884 INVITE\r\nVia: SIP/2.0/UDP host1.example.com;branch=z9hG4bKkdjuw3923\r\nContact: <sip:caller@host1.example.net>\r\nContent-Type: application/sdp\r\nContent-Length: 150\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n"))
+
+// trws, RFC 4475 section 3.1.2.10: SP Characters at End of Request-Line.
+@test
+fn torture_trws_is_refused()
+    test.assert(refused("OPTIONS sip:remote-target@example.com SIP/2.0  \r\nVia: SIP/2.0/TCP host1.example.com;branch=z9hG4bK299342093\r\nTo: <sip:remote-target@example.com>\r\nFrom: <sip:local-resource@example.com>;tag=329429089\r\nCall-ID: trws.oicu34958239neffasdhr2345r\r\nAccept: application/sdp\r\nCSeq: 238923 OPTIONS\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n"))
+
+// baddate, RFC 4475 section 3.1.2.12: Invalid Time Zone in Date Header Field.
+@test
+fn torture_baddate_is_refused()
+    test.assert(refused("INVITE sip:user@example.com SIP/2.0\r\nTo: sip:user@example.com\r\nFrom: sip:caller@example.net;tag=2234923\r\nMax-Forwards: 70\r\nCall-ID: baddate.239423mnsadf3j23lj42--sedfnm234\r\nCSeq: 1392934 INVITE\r\nVia: SIP/2.0/UDP host.example.com;branch=z9hG4bKkdjuw\r\nDate: Fri, 01 Jan 2010 16:00:00 EST\r\nContact: <sip:caller@host5.example.net>\r\nContent-Type: application/sdp\r\nContent-Length: 150\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.5\r\ns=-\r\nc=IN IP4 192.0.2.5\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n"))
+
+// regbadct, RFC 4475 section 3.1.2.13: Failure to Enclose name-addr URI in <>.
+@test
+fn torture_regbadct_is_refused()
+    test.assert(refused("REGISTER sip:example.com SIP/2.0\r\nTo: sip:user@example.com\r\nFrom: sip:user@example.com;tag=998332\r\nMax-Forwards: 70\r\nCall-ID: regbadct.k345asrl3fdbv@10.0.0.1\r\nCSeq: 1 REGISTER\r\nVia: SIP/2.0/UDP 135.180.130.133:5060;branch=z9hG4bKkdjuw\r\nContact: sip:user@example.com?Route=%3Csip:sip.example.com%3E\r\nl: 0\r\n\r\n"))
+
+// badaspec, RFC 4475 section 3.1.2.14: Spaces within addr-spec.
+@test
+fn torture_badaspec_is_refused()
+    test.assert(refused("OPTIONS sip:user@example.org SIP/2.0\r\nVia: SIP/2.0/UDP host4.example.com:5060;branch=z9hG4bKkdju43234\r\nMax-Forwards: 70\r\nFrom: \"Bell, Alexander\" <sip:a.g.bell@example.com>;tag=433423\r\nTo: \"Watson, Thomas\" < sip:t.watson@example.org >\r\nCall-ID: badaspec.sdf0234n2nds0a099u23h3hnnw009cdkne3\r\nAccept: application/sdp\r\nCSeq: 3923239 OPTIONS\r\nl: 0\r\n\r\n"))
+
+// baddn, RFC 4475 section 3.1.2.15: Non-token Characters in Display Name.
+@test
+fn torture_baddn_is_refused()
+    test.assert(refused("OPTIONS sip:t.watson@example.org SIP/2.0\r\nVia:     SIP/2.0/UDP c.example.com:5060;branch=z9hG4bKkdjuw\r\nMax-Forwards:      70\r\nFrom:    Bell, Alexander <sip:a.g.bell@example.com>;tag=43\r\nTo:      Watson, Thomas <sip:t.watson@example.org>\r\nCall-ID: baddn.31415@c.example.com\r\nAccept: application/sdp\r\nCSeq:    3923239 OPTIONS\r\nl: 0\r\n\r\n"))
+
+// badvers, RFC 4475 section 3.1.2.16: Unknown Protocol Version.
+@test
+fn torture_badvers_is_refused()
+    test.assert(refused("OPTIONS sip:t.watson@example.org SIP/7.0\r\nVia:     SIP/7.0/UDP c.example.com;branch=z9hG4bKkdjuw\r\nMax-Forwards:     70\r\nFrom:    A. Bell <sip:a.g.bell@example.com>;tag=qweoiqpe\r\nTo:      T. Watson <sip:t.watson@example.org>\r\nCall-ID: badvers.31417@c.example.com\r\nCSeq:    1 OPTIONS\r\nl: 0\r\n\r\n"))
+
+// mismatch01, RFC 4475 section 3.1.2.17: Start Line and CSeq Method Mismatch.
+@test
+fn torture_mismatch01_is_refused()
+    test.assert(refused("OPTIONS sip:user@example.com SIP/2.0\r\nTo: sip:j.user@example.com\r\nFrom: sip:caller@example.net;tag=34525\r\nMax-Forwards: 6\r\nCall-ID: mismatch01.dj0234sxdfl3\r\nCSeq: 8 INVITE\r\nVia: SIP/2.0/UDP host.example.com;branch=z9hG4bKkdjuw\r\nl: 0\r\n\r\n"))
+
+// mismatch02, RFC 4475 section 3.1.2.18: Unknown Method with CSeq Method Mismatch.
+@test
+fn torture_mismatch02_is_refused()
+    test.assert(refused("NEWMETHOD sip:user@example.com SIP/2.0\r\nTo: sip:j.user@example.com\r\nFrom: sip:caller@example.net;tag=34525\r\nMax-Forwards: 6\r\nCall-ID: mismatch02.dj0234sxdfl3\r\nCSeq: 8 INVITE\r\nContact: <sip:caller@host.example.net>\r\nVia: SIP/2.0/UDP host.example.net;branch=z9hG4bKkdjuw\r\nContent-Type: application/sdp\r\nl: 138\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.1\r\nc=IN IP4 192.0.2.1\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n"))
+
+// bigcode, RFC 4475 section 3.1.2.19: Overlarge Response Code.
+@test
+fn torture_bigcode_is_refused()
+    test.assert(refused("SIP/2.0 4294967301 better not break the receiver\r\nVia: SIP/2.0/UDP 192.0.2.105;branch=z9hG4bK2398ndaoe\r\nCall-ID: bigcode.asdof3uj203asdnf3429uasdhfas3ehjasdfas9i\r\nCSeq: 353494 INVITE\r\nFrom: <sip:user@example.com>;tag=39ansfi3\r\nTo: <sip:user@example.edu>;tag=902jndnke3\r\nContent-Length: 0\r\nContact: <sip:user@host105.example.com>\r\n\r\n"))
+
+// badbranch, RFC 4475 section 3.2.1: Missing Transaction Identifier.
+@test
+fn torture_badbranch_is_refused()
+    test.assert(refused("OPTIONS sip:user@example.com SIP/2.0\r\nTo: sip:user@example.com\r\nFrom: sip:caller@example.org;tag=33242\r\nMax-Forwards: 3\r\nVia: SIP/2.0/UDP 192.0.2.1;branch=z9hG4bK\r\nAccept: application/sdp\r\nCall-ID: badbranch.sadonfo23i420jv0as0derf3j3n\r\nCSeq: 8 OPTIONS\r\nl: 0\r\n\r\n"))
+
+// insuf, RFC 4475 section 3.3.1: Missing Required Header Fields.
+@test
+fn torture_insuf_is_refused()
+    test.assert(refused("INVITE sip:user@example.com SIP/2.0\r\nCSeq: 193942 INVITE\r\nVia: SIP/2.0/UDP 192.0.2.95;branch=z9hG4bKkdj.insuf\r\nContent-Type: application/sdp\r\nl: 152\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.95\r\ns=-\r\nc=IN IP4 192.0.2.95\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n"))
+
+// multi01, RFC 4475 section 3.3.8: Multiple Values in Single Value Required Fields.
+@test
+fn torture_multi01_is_refused()
+    test.assert(refused("INVITE sip:user@company.com SIP/2.0\r\nContact: <sip:caller@host25.example.net>\r\nVia: SIP/2.0/UDP 192.0.2.25;branch=z9hG4bKkdjuw\r\nMax-Forwards: 70\r\nCSeq: 5 INVITE\r\nCall-ID: multi01.98asdh@192.0.2.1\r\nCSeq: 59 INVITE\r\nCall-ID: multi01.98asdh@192.0.2.2\r\nFrom: sip:caller@example.com;tag=3413415\r\nTo: sip:user@example.com\r\nTo: sip:other@example.net\r\nFrom: sip:caller@example.net;tag=2923420123\r\nContent-Type: application/sdp\r\nl: 154\r\nContact: <sip:caller@host36.example.net>\r\nMax-Forwards: 5\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.25\r\ns=-\r\nc=IN IP4 192.0.2.25\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n"))
+
+// mcl01, RFC 4475 section 3.3.9: Multiple Content-Length Values.
+@test
+fn torture_mcl01_is_refused()
+    test.assert(refused("OPTIONS sip:user@example.com SIP/2.0\r\nVia: SIP/2.0/UDP host5.example.net;branch=z9hG4bK293423\r\nTo: sip:user@example.com\r\nFrom: sip:other@example.net;tag=3923942\r\nCall-ID: mcl01.fhn2323orihawfdoa3o4r52o3irsdf\r\nCSeq: 15932 OPTIONS\r\nContent-Length: 13\r\nMax-Forwards: 60\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nThere's no way to know how many octets are supposed to be here.\r\n"))
+
+// escruri, RFC 4475 section 3.1.2.11: Escaped Headers in SIP Request-URI.  The RFC lets an element refuse it or read it; it is read.
+@test
+fn torture_escruri_is_read()
+    let m = load("INVITE sip:user@example.com?Route=%3Csip:example.com%3E SIP/2.0\r\nTo: sip:user@example.com\r\nFrom: sip:caller@example.net;tag=341518\r\nMax-Forwards: 7\r\nContact: <sip:caller@host39923.example.net>\r\nCall-ID: escruri.23940-asdfhj-aje3br-234q098w-fawerh2q-h4n5\r\nCSeq: 149209342 INVITE\r\nVia: SIP/2.0/UDP host-of-the-hour.example.com;branch=z9hG4bKkdjuw\r\nContent-Type: application/sdp\r\nContent-Length: 150\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n")
+    test.assert(valid(m))
+
+// bcast, RFC 4475 section 3.3.10: 200 OK Response with Broadcast Via Header Field Value.  The RFC lets an element refuse it or read it; it is read.
+@test
+fn torture_bcast_is_read()
+    let m = load("SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 192.0.2.198;branch=z9hG4bK1324923\r\nVia: SIP/2.0/UDP 255.255.255.255;branch=z9hG4bK1saber23\r\nCall-ID: bcast.0384840201234ksdfak3j2erwedfsASdf\r\nCSeq: 35 INVITE\r\nFrom: sip:user@example.com;tag=11141343\r\nTo: sip:user@example.edu;tag=2229\r\nContent-Length: 154\r\nContent-Type: application/sdp\r\nContact: <sip:user@host28.example.com>\r\n\r\nv=0\r\no=mhandley 29739 7272939 IN IP4 192.0.2.198\r\ns=-\r\nc=IN IP4 192.0.2.198\r\nt=0 0\r\nm=audio 49217 RTP/AVP 0 12\r\nm=video 3227 RTP/AVP 31\r\na=rtpmap:31 LPC\r\n")
+    test.assert(valid(m))

@@ -1,0 +1,445 @@
+// sipuri.nv — SIP and SIPS URIs, parameters and name-addr values.
+//
+// A SIP URI (RFC 3261 section 19.1.1) is
+//
+//   sip:user:password@host:port;uri-parameters?headers
+//
+// of which only the host is required.  The user part is kept as written, with
+// its percent-escapes, because comparing two URIs undoes the escapes and
+// writing one back must not.  The scheme is lower-cased.  A URI with another
+// scheme, `tel:` for instance, is kept whole in `opaque`, which is what a
+// Request-URI may be (section 7.1).
+//
+// A name-addr (section 25.1) is an optional display name, a URI in angle
+// brackets and header parameters: `"Bob" <sip:bob@biloxi.example>;tag=a73kszlfl`.
+// An addr-spec is a URI with no brackets, and then every `;` after it belongs
+// to the header and not to the URI (section 20, the note on `From`, `To`,
+// `Contact` and `Route`).
+
+use std.str
+use siperr
+use sipstr
+
+// One parameter: `name`, or `name=value`.
+pub struct SipParam
+    name: Str
+    value: Str
+    // False for a parameter written without `=`.
+    has_value: Bool
+
+// A URI.
+pub struct SipUri
+    // `sip`, `sips`, or the other scheme in lower case.
+    scheme: Str
+    // The user part as written, with its escapes; "" when `has_user` is false.
+    user: Str
+    // The password, as written.
+    password: Str
+    // Whether the URI has a user part (an `@`).
+    has_user: Bool
+    // The host name or address; an IPv6 address keeps its brackets.
+    host: Str
+    // The port, or -1 when the URI has none.
+    port: Int
+    // The URI parameters, in order.
+    params: [SipParam]
+    // The URI headers, in order.
+    headers: [SipParam]
+    // For a scheme other than `sip` and `sips`, everything after the colon.
+    opaque: Str
+
+// A name-addr or an addr-spec.
+pub struct SipAddr
+    // The display name, unquoted; "" when there is none.
+    display: Str
+    // The URI.
+    uri: SipUri
+    // The header parameters (`tag`, `expires`, `q`), in order.
+    params: [SipParam]
+    // Whether the URI was written in angle brackets.
+    bracketed: Bool
+
+// A parameter made of its parts.
+//
+// ```novo
+// use sipuri
+//
+// fn main() [io]
+//     let p = sipuri.param("tag", "a73")
+//     println("${p.name}=${p.value} ${p.has_value}")   // tag=a73 true
+// ```
+pub fn param(name: Str, value: Str) -> SipParam
+    SipParam { name: name, value: value, has_value: true }
+
+// A parameter with no value, such as `lr`.
+//
+// ```novo
+// use sipuri
+//
+// fn main() [io]
+//     println("${sipuri.flag("lr").has_value}")   // false
+// ```
+pub fn flag(name: Str) -> SipParam
+    SipParam { name: name, value: "", has_value: false }
+
+// Read one `name`, `name=value` piece.
+fn param_of(piece: Str) -> SipParam
+    match str.index(piece, "=")
+        None     => SipParam { name: str.trim(piece), value: "", has_value: false }
+        Some(eq) => SipParam { name: str.trim(str.slice(piece, 0, eq)),
+                               value: str.trim(str.slice(piece, eq + 1, str.len(piece))), has_value: true }
+
+// Read the parameters in `pieces`, from index `from`, dropping empty ones.
+fn params_from(pieces: [Str], from: Int) -> [SipParam]
+    var out: [SipParam] = []
+    for i in from..list.len(pieces)
+        if str.len(pieces[i]) > 0
+            list.push(out, param_of(pieces[i]))
+    out
+
+// Read a run of `;name=value` parameters.  The text may begin with the first `;`.
+//
+// ```novo
+// use sipuri
+//
+// fn main() [io]
+//     let ps = sipuri.parse_params(";tag=a73;lr")
+//     println("${list.len(ps)} ${ps[0].value} ${ps[1].has_value}")   // 2 a73 false
+// ```
+pub fn parse_params(text: Str) -> [SipParam]
+    params_from(sipstr.split_top(text, 59), 0)
+
+// The value of the first parameter called `name`, compared without case, or
+// None when there is none.  A parameter with no value answers "".
+//
+// ```novo
+// use sipuri
+//
+// fn main() [io]
+//     let ps = sipuri.parse_params(";Tag=a73;lr")
+//     println("${sipuri.find_param(ps, "tag") ?? "-"} ${sipuri.find_param(ps, "x") ?? "-"}")   // a73 -
+// ```
+pub fn find_param(params: [SipParam], name: Str) -> ?Str
+    for p in params
+        if sipstr.eq_ci(p.name, name)
+            return Some(p.value)
+    None
+
+// Whether a parameter called `name` is present, with or without a value.
+//
+// ```novo
+// use sipuri
+//
+// fn main() [io]
+//     println("${sipuri.has_param(sipuri.parse_params(";lr"), "LR")}")   // true
+// ```
+pub fn has_param(params: [SipParam], name: Str) -> Bool
+    for p in params
+        if sipstr.eq_ci(p.name, name)
+            return true
+    false
+
+// Write parameters, each after a `;`.
+//
+// ```novo
+// use sipuri
+//
+// fn main() [io]
+//     println(sipuri.write_params([sipuri.param("tag", "a"), sipuri.flag("lr")]))   // ;tag=a;lr
+// ```
+pub fn write_params(params: [SipParam]) -> Str
+    var out = ""
+    for p in params
+        if p.has_value
+            out = out + ";" + p.name + "=" + p.value
+        else
+            out = out + ";" + p.name
+    out
+
+// Whether `s` is a scheme: a letter, then letters, digits, `+`, `-` and `.`.
+fn scheme_ok(s: Str) -> Bool
+    let n = str.len(s)
+    if n == 0
+        return false
+    for i in 0..n
+        let b = str.byte_at_or(s, i, 0)
+        let letter = (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
+        let other = (b >= 48 and b <= 57) or b == 43 or b == 45 or b == 46
+        if not (letter or (i > 0 and other))
+            return false
+    true
+
+// Split `host[:port]`, answering the host and, through the second function,
+// the port.  An IPv6 reference keeps its brackets.
+fn host_end(hp: Str) -> Int
+    if str.starts_with(hp, "[")
+        match str.index(hp, "]")
+            None     => -1
+            Some(rb) => rb + 1
+    else
+        match str.index(hp, ":")
+            None     => str.len(hp)
+            Some(co) => co
+
+// Read a URI.  Answers `SipBadUri` for a missing scheme, an empty host or
+// user, a port that is not a number up to 65535, or an unclosed bracket.
+//
+// ```novo
+// use sipuri
+//
+// fn main() [io]
+//     match sipuri.parse("sip:alice:secret@atlanta.example:5070;transport=tcp?subject=hi")
+//         Ok(u)  => println("${u.user} ${u.host} ${u.port} ${u.params[0].value} ${u.headers[0].value}")   // alice atlanta.example 5070 tcp hi
+//         Err(e) => println(e.message())
+// ```
+pub fn parse(text: Str) -> Result<SipUri, SipError>
+    let t = str.trim(text)
+    match str.index(t, ":")
+        None     => Err(SipBadUri(t))
+        Some(co) =>
+            let scheme = str.lower(str.slice(t, 0, co))
+            let rest = str.slice(t, co + 1, str.len(t))
+            if not scheme_ok(scheme)
+                return Err(SipBadUri(t))
+            if scheme != "sip" and scheme != "sips"
+                if str.len(rest) == 0
+                    return Err(SipBadUri(t))
+                return Ok(SipUri { scheme: scheme, user: "", password: "", has_user: false, host: "", port: -1,
+                                   params: [], headers: [], opaque: rest })
+            parse_sip(t, scheme, rest)
+
+// Read what follows `sip:` or `sips:`.
+fn parse_sip(t: Str, scheme: Str, rest: Str) -> Result<SipUri, SipError>
+    var main = rest
+    var headers: [SipParam] = []
+    match str.index(rest, "?")
+        None     => main = rest
+        Some(q)  =>
+            main = str.slice(rest, 0, q)
+            for piece in str.split(str.slice(rest, q + 1, str.len(rest)), "&")
+                if str.len(piece) > 0
+                    list.push(headers, param_of(piece))
+    var userinfo = ""
+    var hostpart = main
+    var has_user = false
+    match str.index(main, "@")
+        None     => hostpart = main
+        Some(at) =>
+            has_user = true
+            userinfo = str.slice(main, 0, at)
+            hostpart = str.slice(main, at + 1, str.len(main))
+    var user = userinfo
+    var password = ""
+    match str.index(userinfo, ":")
+        None     => user = userinfo
+        Some(pc) =>
+            user = str.slice(userinfo, 0, pc)
+            password = str.slice(userinfo, pc + 1, str.len(userinfo))
+    if has_user and str.len(user) == 0
+        return Err(SipBadUri(t))
+    let pieces = str.split(hostpart, ";")
+    let hp = pieces[0]
+    let he = host_end(hp)
+    if he < 1
+        return Err(SipBadUri(t))
+    let host = str.slice(hp, 0, he)
+    var port = -1
+    if he < str.len(hp)
+        if str.byte_at_or(hp, he, 0) != 58
+            return Err(SipBadUri(t))
+        port = sipstr.number(str.slice(hp, he + 1, str.len(hp)))
+        if port < 0 or port > 65535
+            return Err(SipBadUri(t))
+    Ok(SipUri { scheme: scheme, user: user, password: password, has_user: has_user, host: host, port: port,
+                params: params_from(pieces, 1), headers: headers, opaque: "" })
+
+// Write a URI the way it was read.
+//
+// ```novo
+// use sipuri
+//
+// fn main() [io]
+//     let u = sipuri.parse("SIP:bob@Biloxi.Example;lr")!
+//     println(sipuri.write(u))   // sip:bob@Biloxi.Example;lr
+// ```
+pub fn write(u: SipUri) -> Str
+    if u.scheme != "sip" and u.scheme != "sips"
+        return u.scheme + ":" + u.opaque
+    var out = u.scheme + ":"
+    if u.has_user
+        out = out + u.user
+        if str.len(u.password) > 0
+            out = out + ":" + u.password
+        out = out + "@"
+    out = out + u.host
+    if u.port >= 0
+        out = out + ":" + str.from_int(u.port)
+    out = out + write_params(u.params)
+    var first = true
+    for h in u.headers
+        if first
+            out = out + "?"
+        else
+            out = out + "&"
+        first = false
+        if h.has_value
+            out = out + h.name + "=" + h.value
+        else
+            out = out + h.name
+    out
+
+// The value of the URI parameter `name`, or None.
+//
+// ```novo
+// use sipuri
+//
+// fn main() [io]
+//     let u = sipuri.parse("sip:a@b;transport=udp")!
+//     println(sipuri.uri_param(u, "transport") ?? "-")   // udp
+// ```
+pub fn uri_param(u: SipUri, name: Str) -> ?Str
+    find_param(u.params, name)
+
+// Whether two parameter lists agree on the parameters that RFC 3261 section
+// 19.1.4 makes significant: `user`, `ttl`, `method`, `maddr` and `transport`
+// must match when either URI has them, and no other parameter counts.
+fn significant_params_equal(a: [SipParam], b: [SipParam]) -> Bool
+    for name in ["user", "ttl", "method", "maddr", "transport"]
+        if has_param(a, name) != has_param(b, name)
+            return false
+        if has_param(a, name)
+            if str.lower(find_param(a, name) ?? "") != str.lower(find_param(b, name) ?? "")
+                return false
+    true
+
+// Whether two header lists hold the same headers: the same names, compared
+// without case, with the same values, in any order.
+fn headers_equal(a: [SipParam], b: [SipParam]) -> Bool
+    if list.len(a) != list.len(b)
+        return false
+    for h in a
+        var found = false
+        for g in b
+            if sipstr.eq_ci(h.name, g.name) and sipstr.unescape(h.value) == sipstr.unescape(g.value)
+                found = true
+        if not found
+            return false
+    true
+
+// Whether two URIs are equal by the rules of RFC 3261 section 19.1.4: the
+// scheme, the user and the password compared after undoing the escapes and
+// with case, the host without case, the port as written (a missing port does
+// not equal 5060), the significant parameters, and the headers.
+//
+// ```novo
+// use sipuri
+//
+// fn main() [io]
+//     let a = sipuri.parse("sip:%61lice@atlanta.example;transport=TCP")!
+//     let b = sipuri.parse("sip:alice@AtLanTa.ExAmPlE;Transport=tcp")!
+//     println("${sipuri.equal(a, b)}")   // true
+// ```
+pub fn equal(a: SipUri, b: SipUri) -> Bool
+    if a.scheme != b.scheme
+        return false
+    if a.scheme != "sip" and a.scheme != "sips"
+        return a.opaque == b.opaque
+    if a.has_user != b.has_user
+        return false
+    if sipstr.unescape(a.user) != sipstr.unescape(b.user)
+        return false
+    if sipstr.unescape(a.password) != sipstr.unescape(b.password)
+        return false
+    if str.lower(a.host) != str.lower(b.host) or a.port != b.port
+        return false
+    significant_params_equal(a.params, b.params) and headers_equal(a.headers, b.headers)
+
+// The position of the first `<` that is not inside a quoted string, or -1.
+fn angle_start(t: Str) -> Int
+    var quoted = false
+    var i = 0
+    let n = str.len(t)
+    for _k in 0..n
+        if i >= n
+            return -1
+        let b = str.byte_at_or(t, i, 0)
+        if quoted
+            if b == 92
+                i = i + 1
+            elif b == 34
+                quoted = false
+        elif b == 34
+            quoted = true
+        elif b == 60
+            return i
+        i = i + 1
+    -1
+
+// Read a name-addr or an addr-spec.  The display name may be a quoted string
+// or a run of tokens; the URI is between `<` and `>`, or is the whole value up
+// to the first `;`.
+//
+// ```novo
+// use sipuri
+//
+// fn main() [io]
+//     match sipuri.parse_addr("\"Bob\" <sip:bob@biloxi.example>;tag=a73kszlfl")
+//         Ok(a)  => println("${a.display} ${a.uri.host} ${sipuri.find_param(a.params, "tag") ?? "-"}")   // Bob biloxi.example a73kszlfl
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_addr(text: Str) -> Result<SipAddr, SipError>
+    let t = str.trim(text)
+    let lt = angle_start(t)
+    if lt < 0
+        let pieces = sipstr.split_top(t, 59)
+        if str.contains(pieces[0], "?") or str.contains(pieces[0], ",")
+            return Err(SipBadAddr(t))
+        match parse(pieces[0])
+            Err(e) => return Err(SipBadAddr(t))
+            Ok(u)  => return Ok(SipAddr { display: "", uri: u, params: params_from(pieces, 1), bracketed: false })
+    match str.index_from(t, ">", lt)
+        None     => Err(SipBadAddr(t))
+        Some(gt) =>
+            let shown = str.trim(str.slice(t, 0, lt))
+            if str.len(shown) > 0 and str.byte_at_or(shown, 0, 0) != 34
+                for w in str.words(shown)
+                    if not sipstr.is_token(w)
+                        return Err(SipBadAddr(t))
+            let inside = str.slice(t, lt + 1, gt)
+            if inside != str.trim(inside)
+                return Err(SipBadAddr(t))
+            let display = sipstr.unquote(shown)
+            let after = str.trim(str.slice(t, gt + 1, str.len(t)))
+            if str.len(after) > 0 and str.byte_at_or(after, 0, 0) != 59
+                return Err(SipBadAddr(t))
+            match parse(str.slice(t, lt + 1, gt))
+                Err(e) => Err(SipBadAddr(t))
+                Ok(u)  => Ok(SipAddr { display: display, uri: u, params: params_from(sipstr.split_top(after, 59), 0),
+                                       bracketed: true })
+
+// Write an address in angle brackets, with its display name quoted when it has one.
+//
+// ```novo
+// use sipuri
+//
+// fn main() [io]
+//     let a = sipuri.parse_addr("Bob <sip:bob@biloxi.example>;tag=1")!
+//     println(sipuri.write_addr(a))   // "Bob" <sip:bob@biloxi.example>;tag=1
+// ```
+pub fn write_addr(a: SipAddr) -> Str
+    var out = ""
+    if str.len(a.display) > 0
+        out = sipstr.quote(a.display) + " "
+    out + "<" + write(a.uri) + ">" + write_params(a.params)
+
+// The `tag` parameter of an address, or "".
+//
+// ```novo
+// use sipuri
+//
+// fn main() [io]
+//     let a = sipuri.parse_addr("<sip:bob@biloxi.example>;tag=xyz")!
+//     println(sipuri.addr_tag(a))   // xyz
+// ```
+pub fn addr_tag(a: SipAddr) -> Str
+    find_param(a.params, "tag") ?? ""

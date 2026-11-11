@@ -1,0 +1,19 @@
+[package]
+name        = "sip-nv"
+version     = "0.1.0"
+description = "SIP for novo-lang."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "networking"
+layer       = "host"
+tags        = ["sip"]
+repository  = "https://github.com/novolang/sip-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+[docs.pages]
+"README.md" = "SIP"
+
+[dependencies]
+sdp-nv = "^0.1.0"
+crypto-nv = "^0.1.8"

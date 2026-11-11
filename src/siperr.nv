@@ -1,0 +1,48 @@
+// siperr.nv — the refusals a SIP message, URI or call can meet.
+//
+// A message that is cut short is not one of them: on a stream the caller
+// reads more bytes and `sipmsg.frame_length` says "not yet".  Every variant
+// here is a fault in the text, in an argument or in the order of calls.
+
+use std.str
+
+// Why a piece of text was not read, or a call was not allowed.
+pub enum SipError
+    // A URI that does not follow RFC 3261 section 19.1.
+    SipBadUri(text: Str)
+    // A name-addr or addr-spec that does not follow section 25.1.
+    SipBadAddr(text: Str)
+    // A request line or status line that does not follow section 7.1 or 7.2.
+    SipBadStartLine(line: Str)
+    // A header line with no colon, or an empty or malformed name.
+    SipBadHeader(line: Str)
+    // A Via value that does not follow section 20.42.
+    SipBadVia(text: Str)
+    // A CSeq value that is not a number and a method.
+    SipBadCSeq(text: Str)
+    // A header the message needs and does not have.
+    SipNoHeader(name: Str)
+    // A Content-Length that is not a number, or is longer than the body.
+    SipBadLength(text: Str)
+    // A challenge or credentials header that does not follow RFC 7616.
+    SipBadAuth(text: Str)
+    // A call that does not belong to the state a session or a transaction is in.
+    SipWrongState(what: Str)
+    // A message that is longer than the limit given.
+    SipTooLong(length: Int)
+
+// What went wrong, in words, for a caller that logs rather than branches.
+impl Error for SipError
+    fn message(self) -> Str
+        match self
+            SipBadUri(text)       => "\"" + text + "\" is not a SIP URI"
+            SipBadAddr(text)      => "\"" + text + "\" is not a name-addr or an addr-spec"
+            SipBadStartLine(line) => "\"" + line + "\" is not a request line or a status line"
+            SipBadHeader(line)    => "\"" + line + "\" is not a header line"
+            SipBadVia(text)       => "\"" + text + "\" is not a Via value"
+            SipBadCSeq(text)      => "\"" + text + "\" is not a CSeq value"
+            SipNoHeader(name)     => "the message has no " + name + " header"
+            SipBadLength(text)    => "\"" + text + "\" is not a Content-Length the body can satisfy"
+            SipBadAuth(text)      => "\"" + text + "\" is not a digest challenge or credentials"
+            SipWrongState(what)   => what
+            SipTooLong(length)    => "a message of " + str.from_int(length) + " octets is over the limit"

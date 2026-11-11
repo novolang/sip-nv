@@ -1,0 +1,809 @@
+// sipmsg.nv — the SIP message of RFC 3261 section 7, read and written as bytes.
+//
+// A message is a start line, headers, an empty line and a body.  A request's
+// start line is `Method SP Request-URI SP SIP/2.0`, a response's is
+// `SIP/2.0 SP Status-Code SP Reason-Phrase`, and every line ends in CRLF.
+//
+// WHAT READING DOES.  The header names are put in their long form
+// (`i` is `Call-ID`, `m` is `Contact`, `e` `Content-Encoding`, `l`
+// `Content-Length`, `c` `Content-Type`, `f` `From`, `s` `Subject`, `k`
+// `Supported`, `t` `To`, `v` `Via`, RFC 3261 section 7.3.3) and spelled with
+// the capitals the RFC uses; a name this module does not know is kept as it
+// was written.  A line that begins with a space or a tab continues the line
+// before it (section 7.3.1).  A header that the grammar makes a comma-
+// separated list (Via, Route, Record-Route, Contact and the others in
+// `list_headers`) becomes one entry for each element, so that the topmost
+// Via is `via_list(msg)[0]`; the quoted strings and the angle brackets of
+// the elements are respected when splitting.  The body is the octets after
+// the empty line, cut to Content-Length when that is shorter (section 18.3
+// for a datagram).
+//
+// WHAT WRITING DOES.  The headers go out as `Name: value` in the order the
+// message holds them, and a Content-Length is added when the message has none.
+//
+// A STREAM (section 18.3) has no datagram boundary, so `frame_length` says how
+// many octets the first message in a buffer takes, from its Content-Length, or
+// -1 when more are needed.
+
+use std.bytes
+use std.str
+use siperr
+use sipstr
+use sipuri
+
+// One header line, or one element of a list header.
+pub struct SipHeader
+    // The name in its long form.
+    name: Str
+    // The value, trimmed.
+    value: Str
+
+// A request or a response.
+pub struct SipMessage
+    is_request: Bool
+    // The method of a request, as written.
+    method: Str
+    // The Request-URI of a request, as written.
+    uri: Str
+    // The status code of a response.
+    status: Int
+    // The reason phrase of a response.
+    reason: Str
+    // The SIP-Version; "SIP/2.0".
+    version: Str
+    headers: [SipHeader]
+    body: Bytes
+
+// One Via value (section 20.42).
+pub struct SipVia
+    // The protocol name and version: "SIP/2.0".
+    protocol: Str
+    // The transport: UDP, TCP, TLS, SCTP, WS.
+    transport: Str
+    // The host of the sent-by, with the brackets of an IPv6 address.
+    host: Str
+    // The port of the sent-by, or -1.
+    port: Int
+    // `branch`, `received`, `rport`, `maddr`, `ttl` and the others.
+    params: [sipuri.SipParam]
+
+// The value of a CSeq header.
+pub struct SipCSeq
+    seq: Int
+    method: Str
+
+// The magic cookie that begins every branch of RFC 3261 (section 8.1.1.7).
+pub const SIP_MAGIC = "z9hG4bK"
+
+// The headers that RFC 3261 gives the form of a comma-separated list.
+fn list_headers() -> [Str]
+    ["Via", "Route", "Record-Route", "Contact", "Allow", "Supported", "Require", "Proxy-Require", "Unsupported",
+     "Accept", "Accept-Encoding", "Accept-Language", "Alert-Info", "Call-Info", "Content-Encoding",
+     "Content-Language", "Error-Info", "In-Reply-To", "Warning", "Path", "Allow-Events"]
+
+// The names that have a spelling of their own, in the capitals of the RFC.
+fn known_names() -> [Str]
+    ["Accept", "Accept-Encoding", "Accept-Language", "Alert-Info", "Allow", "Allow-Events", "Authentication-Info",
+     "Authorization", "Call-ID", "Call-Info", "Contact", "Content-Disposition", "Content-Encoding",
+     "Content-Language", "Content-Length", "Content-Type", "CSeq", "Date", "Error-Info", "Expires", "From",
+     "In-Reply-To", "Max-Forwards", "MIME-Version", "Min-Expires", "Organization", "Path", "Priority",
+     "Proxy-Authenticate", "Proxy-Authorization", "Proxy-Require", "RAck", "Record-Route", "Reply-To",
+     "Require", "Retry-After", "Route", "RSeq", "Server", "Subject", "Supported", "Timestamp", "To",
+     "Unsupported", "User-Agent", "Via", "Warning", "WWW-Authenticate"]
+
+// The long form and spelling of a header name.
+//
+// ```novo
+// use sipmsg
+//
+// fn main() [io]
+//     println("${sipmsg.canonical("v")} ${sipmsg.canonical("call-id")} ${sipmsg.canonical("X-Odd")}")   // Via Call-ID X-Odd
+// ```
+pub fn canonical(name: Str) -> Str
+    let n = str.lower(name)
+    match n
+        "i" => "Call-ID"
+        "m" => "Contact"
+        "e" => "Content-Encoding"
+        "l" => "Content-Length"
+        "c" => "Content-Type"
+        "f" => "From"
+        "s" => "Subject"
+        "k" => "Supported"
+        "t" => "To"
+        "v" => "Via"
+        _   =>
+            for k in known_names()
+                if str.lower(k) == n
+                    return k
+            name
+
+// Whether a header name is a comma-separated list.
+fn is_list(name: Str) -> Bool
+    for k in list_headers()
+        if k == name
+            return true
+    false
+
+// A header made of its parts; the name is put in its long form.
+//
+// ```novo
+// use sipmsg
+//
+// fn main() [io]
+//     let h = sipmsg.header_of("i", "a84b4c76e66710")
+//     println("${h.name}: ${h.value}")   // Call-ID: a84b4c76e66710
+// ```
+pub fn header_of(name: Str, value: Str) -> SipHeader
+    SipHeader { name: canonical(name), value: value }
+
+// A request.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.request("OPTIONS", "sip:a@b.example", [sipmsg.header_of("Call-ID", "x")], bytes.from_str(""))
+//     println("${m.is_request} ${m.method} ${m.version}")   // true OPTIONS SIP/2.0
+// ```
+pub fn request(method: Str, uri: Str, headers: [SipHeader], body: Bytes) -> SipMessage
+    SipMessage { is_request: true, method: method, uri: uri, status: 0, reason: "", version: "SIP/2.0",
+                 headers: headers, body: body }
+
+// A response.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.response(180, "Ringing", [], bytes.from_str(""))
+//     println("${m.is_request} ${m.status} ${m.reason}")   // false 180 Ringing
+// ```
+pub fn response(status: Int, reason: Str, headers: [SipHeader], body: Bytes) -> SipMessage
+    SipMessage { is_request: false, method: "", uri: "", status: status, reason: reason, version: "SIP/2.0",
+                 headers: headers, body: body }
+
+// The reason phrase RFC 3261 section 21 suggests for a status code.
+//
+// ```novo
+// use sipmsg
+//
+// fn main() [io]
+//     println("${sipmsg.reason_of(486)} / ${sipmsg.reason_of(299)}")   // Busy Here / Unknown
+// ```
+pub fn reason_of(status: Int) -> Str
+    match status
+        100 => "Trying"
+        180 => "Ringing"
+        181 => "Call Is Being Forwarded"
+        182 => "Queued"
+        183 => "Session Progress"
+        200 => "OK"
+        202 => "Accepted"
+        300 => "Multiple Choices"
+        301 => "Moved Permanently"
+        302 => "Moved Temporarily"
+        305 => "Use Proxy"
+        380 => "Alternative Service"
+        400 => "Bad Request"
+        401 => "Unauthorized"
+        403 => "Forbidden"
+        404 => "Not Found"
+        405 => "Method Not Allowed"
+        406 => "Not Acceptable"
+        407 => "Proxy Authentication Required"
+        408 => "Request Timeout"
+        410 => "Gone"
+        413 => "Request Entity Too Large"
+        414 => "Request-URI Too Long"
+        415 => "Unsupported Media Type"
+        416 => "Unsupported URI Scheme"
+        420 => "Bad Extension"
+        421 => "Extension Required"
+        423 => "Interval Too Brief"
+        480 => "Temporarily Unavailable"
+        481 => "Call/Transaction Does Not Exist"
+        482 => "Loop Detected"
+        483 => "Too Many Hops"
+        484 => "Address Incomplete"
+        485 => "Ambiguous"
+        486 => "Busy Here"
+        487 => "Request Terminated"
+        488 => "Not Acceptable Here"
+        491 => "Request Pending"
+        493 => "Undecipherable"
+        500 => "Server Internal Error"
+        501 => "Not Implemented"
+        502 => "Bad Gateway"
+        503 => "Service Unavailable"
+        504 => "Server Time-out"
+        505 => "Version Not Supported"
+        513 => "Message Too Large"
+        600 => "Busy Everywhere"
+        603 => "Decline"
+        604 => "Does Not Exist Anywhere"
+        606 => "Not Acceptable"
+        _   => "Unknown"
+
+// ── Headers ───────────────────────────────────────────────────────────────
+
+// The values of the headers called `name` (any spelling), in order.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.request("X", "sip:a@b", [sipmsg.header_of("v", "SIP/2.0/UDP a"), sipmsg.header_of("Via", "SIP/2.0/UDP b")], bytes.from_str(""))
+//     println("${list.len(sipmsg.header_values(m, "Via"))}")   // 2
+// ```
+pub fn header_values(m: SipMessage, name: Str) -> [Str]
+    let want = canonical(name)
+    var out: [Str] = []
+    for h in m.headers
+        if h.name == want
+            list.push(out, h.value)
+    out
+
+// The value of the first header called `name`, or None.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.request("X", "sip:a@b", [sipmsg.header_of("Call-ID", "c1")], bytes.from_str(""))
+//     println("${sipmsg.header_value(m, "call-id") ?? "-"} ${sipmsg.header_value(m, "To") ?? "-"}")   // c1 -
+// ```
+pub fn header_value(m: SipMessage, name: Str) -> ?Str
+    let want = canonical(name)
+    for h in m.headers
+        if h.name == want
+            return Some(h.value)
+    None
+
+// Whether the message has a header called `name`.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.request("X", "sip:a@b", [sipmsg.header_of("Call-ID", "c1")], bytes.from_str(""))
+//     println("${sipmsg.has_header(m, "Call-ID")} ${sipmsg.has_header(m, "To")}")   // true false
+// ```
+pub fn has_header(m: SipMessage, name: Str) -> Bool
+    let want = canonical(name)
+    for h in m.headers
+        if h.name == want
+            return true
+    false
+
+// A copy of the message with all the headers called `name` taken out.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.request("X", "sip:a@b", [sipmsg.header_of("Call-ID", "c1")], bytes.from_str(""))
+//     println("${list.len(sipmsg.remove_header(m, "Call-ID").headers)}")   // 0
+// ```
+pub fn remove_header(m: SipMessage, name: Str) -> SipMessage
+    let want = canonical(name)
+    var hs: [SipHeader] = []
+    for h in m.headers
+        if h.name != want
+            list.push(hs, h)
+    SipMessage { is_request: m.is_request, method: m.method, uri: m.uri, status: m.status, reason: m.reason,
+                 version: m.version, headers: hs, body: m.body }
+
+// A copy of the message in which the header `name` has the one value `value`,
+// in the place of the first such header, or at the end when there was none.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.request("X", "sip:a@b", [sipmsg.header_of("Call-ID", "c1")], bytes.from_str(""))
+//     println(sipmsg.header_value(sipmsg.set_header(m, "Call-ID", "c2"), "Call-ID") ?? "-")   // c2
+// ```
+pub fn set_header(m: SipMessage, name: Str, value: Str) -> SipMessage
+    let want = canonical(name)
+    var hs: [SipHeader] = []
+    var done = false
+    for h in m.headers
+        if h.name == want
+            if not done
+                list.push(hs, SipHeader { name: want, value: value })
+                done = true
+        else
+            list.push(hs, h)
+    if not done
+        list.push(hs, SipHeader { name: want, value: value })
+    SipMessage { is_request: m.is_request, method: m.method, uri: m.uri, status: m.status, reason: m.reason,
+                 version: m.version, headers: hs, body: m.body }
+
+// A copy of the message with a header added at the end, or, with `first`,
+// at the front (a proxy puts its own Via there).
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.request("X", "sip:a@b", [sipmsg.header_of("Call-ID", "c1")], bytes.from_str(""))
+//     println(sipmsg.add_header(m, "Via", "SIP/2.0/UDP a", true).headers[0].name)   // Via
+// ```
+pub fn add_header(m: SipMessage, name: Str, value: Str, first: Bool) -> SipMessage
+    var hs: [SipHeader] = []
+    if first
+        list.push(hs, SipHeader { name: canonical(name), value: value })
+    for h in m.headers
+        list.push(hs, h)
+    if not first
+        list.push(hs, SipHeader { name: canonical(name), value: value })
+    SipMessage { is_request: m.is_request, method: m.method, uri: m.uri, status: m.status, reason: m.reason,
+                 version: m.version, headers: hs, body: m.body }
+
+// A copy of the message with another body, and a Content-Length that agrees.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.request("X", "sip:a@b", [], bytes.from_str(""))
+//     let n = sipmsg.with_body(m, "application/sdp", bytes.from_str("v=0"))
+//     println("${sipmsg.header_value(n, "Content-Length") ?? "-"} ${sipmsg.header_value(n, "Content-Type") ?? "-"}")   // 3 application/sdp
+// ```
+pub fn with_body(m: SipMessage, content_type: Str, body: Bytes) -> SipMessage
+    let withlen = set_header(m, "Content-Length", str.from_int(bytes.len(body)))
+    let typed = set_header(withlen, "Content-Type", content_type)
+    SipMessage { is_request: typed.is_request, method: typed.method, uri: typed.uri, status: typed.status,
+                 reason: typed.reason, version: typed.version, headers: typed.headers, body: body }
+
+// ── Reading ───────────────────────────────────────────────────────────────
+
+// The position of the first CRLF CRLF in `data`, or -1.
+fn head_end(data: Bytes) -> Int
+    match bytes.find(data, bytes.from_str("\r\n\r\n"), 0)
+        None    => -1
+        Some(i) => i
+
+// Join the continuation lines (section 7.3.1) into the lines before them.
+fn unfold(lines: [Str]) -> [Str]
+    var out: [Str] = []
+    for l in lines
+        let c = str.byte_at_or(l, 0, 0)
+        if (c == 32 or c == 9) and list.len(out) > 0
+            let last = list.len(out) - 1
+            out[last] = out[last] + " " + str.trim(l)
+        else
+            list.push(out, l)
+    out
+
+// Read a start line into a message with no headers.
+fn parse_start(line: Str) -> Result<SipMessage, SipError>
+    let parts = str.split(line, " ")
+    if str.starts_with(str.lower(line), "sip/")
+        // SIP-Version SP Status-Code SP Reason-Phrase
+        if list.len(parts) < 2 or str.lower(parts[0]) != "sip/2.0" or str.len(parts[1]) != 3
+            return Err(SipBadStartLine(line))
+        let code = sipstr.number(parts[1])
+        if code < 100 or code > 699
+            return Err(SipBadStartLine(line))
+        var reason = ""
+        if list.len(parts) > 2
+            reason = str.join(list.slice(parts, 2, list.len(parts)), " ")
+        return Ok(response(code, reason, [], bytes.from_str("")))
+    // Method SP Request-URI SP SIP-Version
+    if list.len(parts) != 3 or not sipstr.is_token(parts[0]) or str.len(parts[1]) == 0
+        return Err(SipBadStartLine(line))
+    if str.lower(parts[2]) != "sip/2.0"
+        return Err(SipBadStartLine(line))
+    Ok(request(parts[0], parts[1], [], bytes.from_str("")))
+
+// Read one header line into entries: one, or one for each element of a list header.
+fn parse_header(line: Str, var out: [SipHeader]) -> Result<Int, SipError>
+    match str.index(line, ":")
+        None     => Err(SipBadHeader(line))
+        Some(co) =>
+            let raw = str.trim(str.slice(line, 0, co))
+            if not sipstr.is_token(raw)
+                return Err(SipBadHeader(line))
+            let name = canonical(raw)
+            let value = str.trim(str.slice(line, co + 1, str.len(line)))
+            if is_list(name) and str.len(value) > 0 and value != "*"
+                for piece in sipstr.split_top(value, 44)
+                    list.push(out, SipHeader { name: name, value: piece })
+            else
+                list.push(out, SipHeader { name: name, value: value })
+            Ok(0)
+
+// Read a message from the octets of one datagram, or of one framed message of
+// a stream.  The headers must end with an empty line.  A Content-Length that
+// is longer than what follows is `SipBadLength`; a shorter one cuts the body.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let text = "OPTIONS sip:a@b.example SIP/2.0\r\nv: SIP/2.0/UDP h;branch=z9hG4bKx\r\nCall-ID: c1\r\nl: 0\r\n\r\n"
+//     match sipmsg.parse(bytes.from_str(text))
+//         Ok(m)  => println("${m.method} ${sipmsg.header_value(m, "Via") ?? "-"}")   // OPTIONS SIP/2.0/UDP h;branch=z9hG4bKx
+//         Err(e) => println(e.message())
+// ```
+pub fn parse(raw: Bytes) -> Result<SipMessage, SipError>
+    // A CRLF before the start line is ignored (section 7.5).
+    let data = bytes.slice(raw, skip_crlf(raw), bytes.len(raw))
+    let he = head_end(data)
+    if he < 0
+        return Err(SipBadStartLine("no empty line ends the headers"))
+    let head = bytes.to_str(bytes.slice(data, 0, he))
+    let lines = unfold(str.split(head, "\r\n"))
+    let start = parse_start(lines[0])!
+    var hs: [SipHeader] = []
+    for i in 1..list.len(lines)
+        let _ = parse_header(lines[i], var hs)!
+    var body = bytes.slice(data, he + 4, bytes.len(data))
+    var cl = -1
+    for h in hs
+        if h.name == "Content-Length"
+            let n = sipstr.number(h.value)
+            if n < 0 or (cl >= 0 and n != cl)
+                return Err(SipBadLength(h.value))
+            cl = n
+    if cl >= 0
+        if cl > bytes.len(body)
+            return Err(SipBadLength(str.from_int(cl)))
+        body = bytes.slice(body, 0, cl)
+    Ok(SipMessage { is_request: start.is_request, method: start.method, uri: start.uri, status: start.status,
+                    reason: start.reason, version: start.version, headers: hs, body: body })
+
+// The number of octets the first message in `buf` takes on a stream: its head,
+// the empty line and the body that its Content-Length gives (none when it has
+// no Content-Length).  -1 when `buf` does not yet hold all of it.  Leading
+// CRLFs are not counted as part of any message; `skip_crlf` says how many.
+//
+// ```novo
+// use sipmsg
+//
+// fn main() [io]
+//     let text = "BYE sip:a@b SIP/2.0\r\nContent-Length: 3\r\n\r\nabcXYZ"
+//     println("${sipmsg.frame_length(bytes.from_str(text))!}")   // 45
+// ```
+pub fn frame_length(buf: Bytes) -> Result<Int, SipError>
+    let skip = skip_crlf(buf)
+    let data = bytes.slice(buf, skip, bytes.len(buf))
+    let he = head_end(data)
+    if he < 0
+        return Ok(-1)
+    let head = bytes.to_str(bytes.slice(data, 0, he))
+    var cl = 0
+    for line in unfold(str.split(head, "\r\n"))
+        let co = str.index(line, ":") ?? -1
+        if co > 0 and canonical(str.trim(str.slice(line, 0, co))) == "Content-Length"
+            cl = sipstr.number(str.trim(str.slice(line, co + 1, str.len(line))))
+            if cl < 0
+                return Err(SipBadLength(line))
+    if bytes.len(data) < he + 4 + cl
+        return Ok(-1)
+    Ok(he + 4 + cl)
+
+// The number of CRLF pairs at the start of `buf`, which a stream parser skips
+// before a start line.
+//
+// ```novo
+// use sipmsg
+//
+// fn main() [io]
+//     println("${sipmsg.skip_crlf(bytes.from_str("\r\n\r\nINVITE"))}")   // 4
+// ```
+pub fn skip_crlf(buf: Bytes) -> Int
+    var n = 0
+    for _i in 0..bytes.len(buf)
+        if bytes.byte_at(buf, n) == Some(13) and bytes.byte_at(buf, n + 1) == Some(10)
+            n = n + 2
+        else
+            return n
+    n
+
+// ── Writing ───────────────────────────────────────────────────────────────
+
+// The start line and headers of a message, with the empty line, as text.  A
+// Content-Length is added when the message has none.
+fn head_text(m: SipMessage) -> Str
+    var out = ""
+    if m.is_request
+        out = m.method + " " + m.uri + " " + m.version + "\r\n"
+    else
+        out = m.version + " " + str.from_int(m.status) + " " + m.reason + "\r\n"
+    for h in m.headers
+        out = out + h.name + ": " + h.value + "\r\n"
+    if not has_header(m, "Content-Length")
+        out = out + "Content-Length: " + str.from_int(bytes.len(m.body)) + "\r\n"
+    out + "\r\n"
+
+// The octets of a message.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.response(200, "OK", [sipmsg.header_of("Call-ID", "c1")], bytes.from_str(""))
+//     println(bytes.to_str(sipmsg.write(m)))
+//     // SIP/2.0 200 OK
+//     // Call-ID: c1
+//     // Content-Length: 0
+//     //
+// ```
+pub fn write(m: SipMessage) -> Bytes
+    bytes.concat([bytes.from_str(head_text(m)), m.body])
+
+// The body as text.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.request("X", "sip:a@b", [], bytes.from_str("v=0"))
+//     println(sipmsg.body_text(m))   // v=0
+// ```
+pub fn body_text(m: SipMessage) -> Str
+    bytes.to_str(m.body)
+
+// ── Via, CSeq and the other headers ───────────────────────────────────────
+
+// Read a Via value: `SIP/2.0/UDP host:port;branch=...`.  White space is allowed
+// around the slashes, as the grammar has it.
+//
+// ```novo
+// use sipmsg
+//
+// fn main() [io]
+//     match sipmsg.parse_via("SIP / 2.0 / TCP [2001:db8::1]:5061;branch=z9hG4bK77;rport")
+//         Ok(v)  => println("${v.transport} ${v.host} ${v.port} ${sipmsg.via_branch(v)}")   // TCP [2001:db8::1] 5061 z9hG4bK77
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_via(text: Str) -> Result<SipVia, SipError>
+    let pieces = sipstr.split_top(text, 59)
+    var words: [Str] = []
+    for w in str.words(pieces[0])
+        list.push(words, w)
+    if list.len(words) < 2
+        return Err(SipBadVia(text))
+    let sent_by = words[list.len(words) - 1]
+    var proto = ""
+    for k in 0..list.len(words) - 1
+        proto = proto + words[k]
+    let ps = str.split(proto, "/")
+    if list.len(ps) != 3 or str.lower(ps[0]) != "sip" or str.len(ps[2]) == 0
+        return Err(SipBadVia(text))
+    var host = sent_by
+    var port = -1
+    if str.starts_with(sent_by, "[")
+        match str.index(sent_by, "]")
+            None     => return Err(SipBadVia(text))
+            Some(rb) =>
+                host = str.slice(sent_by, 0, rb + 1)
+                if rb + 1 < str.len(sent_by)
+                    port = sipstr.number(str.slice(sent_by, rb + 2, str.len(sent_by)))
+                    if port < 0 or str.byte_at_or(sent_by, rb + 1, 0) != 58
+                        return Err(SipBadVia(text))
+    else
+        match str.index(sent_by, ":")
+            None     => host = sent_by
+            Some(co) =>
+                host = str.slice(sent_by, 0, co)
+                port = sipstr.number(str.slice(sent_by, co + 1, str.len(sent_by)))
+                if port < 0
+                    return Err(SipBadVia(text))
+    if str.len(host) == 0
+        return Err(SipBadVia(text))
+    var params: [sipuri.SipParam] = []
+    for i in 1..list.len(pieces)
+        if str.len(pieces[i]) > 0
+            for p in sipuri.parse_params(pieces[i])
+                list.push(params, p)
+    Ok(SipVia { protocol: ps[0] + "/" + ps[1], transport: str.upper(ps[2]), host: host, port: port, params: params })
+
+// Write a Via value.
+//
+// ```novo
+// use sipmsg
+//
+// fn main() [io]
+//     let v = sipmsg.new_via("UDP", "pc33.atlanta.example", 5060, "z9hG4bK776asdhds")
+//     println(sipmsg.write_via(v))   // SIP/2.0/UDP pc33.atlanta.example:5060;branch=z9hG4bK776asdhds
+// ```
+pub fn write_via(v: SipVia) -> Str
+    var out = v.protocol + "/" + v.transport + " " + v.host
+    if v.port >= 0
+        out = out + ":" + str.from_int(v.port)
+    out + sipuri.write_params(v.params)
+
+// A Via for a request this element sends.
+//
+// ```novo
+// use sipmsg
+//
+// fn main() [io]
+//     println(sipmsg.new_via("TCP", "h", -1, "z9hG4bKa").transport)   // TCP
+// ```
+pub fn new_via(transport: Str, host: Str, port: Int, branch: Str) -> SipVia
+    SipVia { protocol: "SIP/2.0", transport: transport, host: host, port: port,
+             params: [sipuri.param("branch", branch)] }
+
+// The branch parameter of a Via, or "".
+//
+// ```novo
+// use sipmsg
+//
+// fn main() [io]
+//     println(sipmsg.via_branch(sipmsg.new_via("UDP", "h", -1, "z9hG4bKa")))   // z9hG4bKa
+// ```
+pub fn via_branch(v: SipVia) -> Str
+    sipuri.find_param(v.params, "branch") ?? ""
+
+// Whether a branch begins with the magic cookie, which makes it unique by the
+// rules of RFC 3261 and lets the transaction matching of section 17 apply.
+//
+// ```novo
+// use sipmsg
+//
+// fn main() [io]
+//     println("${sipmsg.branch_is_rfc3261("z9hG4bK776")} ${sipmsg.branch_is_rfc3261("776")}")   // true false
+// ```
+pub fn branch_is_rfc3261(branch: Str) -> Bool
+    str.starts_with(branch, SIP_MAGIC) and str.len(branch) > str.len(SIP_MAGIC)
+
+// The Via headers of a message, in order, each read.  A Via that cannot be
+// read ends the list.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.request("X", "sip:a@b", [sipmsg.header_of("Via", "SIP/2.0/UDP a;branch=z9hG4bK1")], bytes.from_str(""))
+//     println("${list.len(sipmsg.via_list(m))}")   // 1
+// ```
+pub fn via_list(m: SipMessage) -> [SipVia]
+    var out: [SipVia] = []
+    for v in header_values(m, "Via")
+        match parse_via(v)
+            Ok(x)  => list.push(out, x)
+            Err(_) => return out
+    out
+
+// Read the CSeq of a message.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.request("X", "sip:a@b", [sipmsg.header_of("CSeq", "314159 INVITE")], bytes.from_str(""))
+//     match sipmsg.cseq(m)
+//         Ok(c)  => println("${c.seq} ${c.method}")   // 314159 INVITE
+//         Err(e) => println(e.message())
+// ```
+pub fn cseq(m: SipMessage) -> Result<SipCSeq, SipError>
+    match header_value(m, "CSeq")
+        None    => Err(SipNoHeader("CSeq"))
+        Some(v) =>
+            let w = str.words(v)
+            if list.len(w) != 2 or sipstr.number(w[0]) < 0
+                return Err(SipBadCSeq(v))
+            Ok(SipCSeq { seq: sipstr.number(w[0]), method: w[1] })
+
+// The Call-ID of a message, or "".
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.request("X", "sip:a@b", [sipmsg.header_of("i", "abc")], bytes.from_str(""))
+//     println(sipmsg.call_id(m))   // abc
+// ```
+pub fn call_id(m: SipMessage) -> Str
+    header_value(m, "Call-ID") ?? ""
+
+// The From header read as an address.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+// use sipuri
+//
+// fn main() [io]
+//     let m = sipmsg.request("X", "sip:a@b", [sipmsg.header_of("f", "<sip:a@b>;tag=1")], bytes.from_str(""))
+//     println(sipuri.addr_tag(sipmsg.from_addr(m)!))   // 1
+// ```
+pub fn from_addr(m: SipMessage) -> Result<sipuri.SipAddr, SipError>
+    match header_value(m, "From")
+        None    => Err(SipNoHeader("From"))
+        Some(v) => sipuri.parse_addr(v)
+
+// The To header read as an address.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+//
+// fn main() [io]
+//     let m = sipmsg.request("X", "sip:a@b", [sipmsg.header_of("t", "<sip:a@b>")], bytes.from_str(""))
+//     println(sipmsg.to_addr(m)!.uri.host)   // b
+// ```
+pub fn to_addr(m: SipMessage) -> Result<sipuri.SipAddr, SipError>
+    match header_value(m, "To")
+        None    => Err(SipNoHeader("To"))
+        Some(v) => sipuri.parse_addr(v)
+
+// ── Validation ────────────────────────────────────────────────────────────
+
+// Whether a header is named at most once; RFC 3261 section 7.3.1 gives these
+// headers a single value.
+fn once(m: SipMessage, name: Str) -> Bool
+    list.len(header_values(m, name)) <= 1
+
+// Check what the grammar and RFC 3261 section 8.1.1 and 8.2.6 require of a
+// message that `parse` read: the Request-URI is a URI; To, From, CSeq,
+// Call-ID and Via are present; To, From, CSeq,
+// Call-ID and Max-Forwards are not repeated; CSeq is a number below 2^31 and
+// its method is the request's; Max-Forwards, when there is one, is 0 to 255; To, From and every
+// Contact are addresses; every Via can be read, and none of a request's is a magic cookie and nothing
+// more; a Date ends in GMT.  A request with no Max-Forwards is read, because RFC 2543
+// senders left it out (RFC 4475 section 3.4.1).  Answers
+// the first fault.
+//
+// ```novo
+// use sipmsg
+//
+// fn main() [io]
+//     let text = "OPTIONS sip:a@b SIP/2.0\r\nTo: <sip:a@b>\r\nFrom: <sip:c@d>;tag=1\r\nCall-ID: x\r\nCSeq: 1 BYE\r\nMax-Forwards: 70\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKa\r\n\r\n"
+//     let m = sipmsg.parse(bytes.from_str(text))!
+//     match sipmsg.validate(m)
+//         Ok(_)  => println("valid")
+//         Err(e) => println(e.message())   // "1 BYE" is not a CSeq value
+// ```
+pub fn validate(m: SipMessage) -> Result<Int, SipError>
+    if m.is_request
+        match sipuri.parse(m.uri)
+            Err(_) => return Err(SipBadUri(m.uri))
+            Ok(_)  => 0
+    for name in ["To", "From", "CSeq", "Call-ID", "Via"]
+        if not has_header(m, name)
+            return Err(SipNoHeader(name))
+    for name in ["To", "From", "CSeq", "Call-ID", "Max-Forwards"]
+        if not once(m, name)
+            return Err(SipBadHeader(name + " is repeated"))
+    let c = cseq(m)!
+    if c.seq > 2147483647
+        return Err(SipBadCSeq(str.from_int(c.seq)))
+    if m.is_request and c.method != m.method
+        return Err(SipBadCSeq(str.from_int(c.seq) + " " + c.method))
+    let mf = header_value(m, "Max-Forwards") ?? "0"
+    if sipstr.number(mf) < 0 or sipstr.number(mf) > 255
+        return Err(SipBadHeader("Max-Forwards: " + mf))
+    let _ = from_addr(m)!
+    let _ = to_addr(m)!
+    for v in header_values(m, "Contact")
+        if v != "*"
+            let _ = sipuri.parse_addr(v)!
+    for v in header_values(m, "Via")
+        let x = parse_via(v)!
+        if m.is_request and via_branch(x) == SIP_MAGIC
+            return Err(SipBadVia(v))
+    let stamp = header_value(m, "Date") ?? "GMT"
+    if not str.ends_with(stamp, "GMT")
+        return Err(SipBadHeader("Date: " + stamp))
+    Ok(0)

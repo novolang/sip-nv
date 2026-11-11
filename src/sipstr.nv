@@ -1,0 +1,181 @@
+// sipstr.nv — the small string operations that the SIP grammar is built on.
+//
+// SIP (RFC 3261 section 25) is a text grammar in which a comma, a semicolon
+// and a space mean something only outside a quoted string and outside the
+// angle brackets of a URI.  `split_top` is the one place where that rule is
+// written; the other modules call it.  Nothing here knows what a header is.
+
+use std.str
+
+// The value of `s` when it is one to fifteen ASCII digits, and -1 otherwise.
+//
+// ```novo
+// use sipstr
+//
+// fn main() [io]
+//     println("${sipstr.number("5060")} ${sipstr.number("5x")} ${sipstr.number("")}")   // 5060 -1 -1
+// ```
+pub fn number(s: Str) -> Int
+    let n = str.len(s)
+    if n < 1 or n > 15
+        return -1
+    var v = 0
+    for i in 0..n
+        let b = str.byte_at_or(s, i, 0)
+        if b < 48 or b > 57
+            return -1
+        v = v * 10 + (b - 48)
+    v
+
+// Whether two strings are equal when letters are compared without case.
+//
+// ```novo
+// use sipstr
+//
+// fn main() [io]
+//     println("${sipstr.eq_ci("Call-ID", "call-id")} ${sipstr.eq_ci("a", "b")}")   // true false
+// ```
+pub fn eq_ci(a: Str, b: Str) -> Bool
+    str.lower(a) == str.lower(b)
+
+// Split `text` at each `sep` that is outside a quoted string and outside the
+// angle brackets, and trim every piece.  A backslash inside a quoted string
+// escapes the next octet (RFC 3261 section 25.1, `quoted-pair`).  An empty
+// text gives one empty piece.
+//
+// ```novo
+// use sipstr
+//
+// fn main() [io]
+//     let parts = sipstr.split_top("<sip:a;b>, \"x,y\" <sip:c>", 44)
+//     println("${list.len(parts)} ${parts[1]}")   // 2 "x,y" <sip:c>
+// ```
+pub fn split_top(text: Str, sep: Int) -> [Str]
+    var out: [Str] = []
+    var from = 0
+    var quoted = false
+    var angle = false
+    let n = str.len(text)
+    var i = 0
+    for _k in 0..n
+        if i >= n
+            break
+        let b = str.byte_at_or(text, i, 0)
+        if quoted
+            if b == 92
+                i = i + 1
+            elif b == 34
+                quoted = false
+        elif b == 34
+            quoted = true
+        elif b == 60
+            angle = true
+        elif b == 62
+            angle = false
+        elif b == sep and not angle
+            list.push(out, str.trim(str.slice(text, from, i)))
+            from = i + 1
+        i = i + 1
+    list.push(out, str.trim(str.slice(text, from, n)))
+    out
+
+// The value of a hexadecimal digit, or -1.
+fn hex_value(b: Int) -> Int
+    if b >= 48 and b <= 57
+        return b - 48
+    if b >= 97 and b <= 102
+        return b - 87
+    if b >= 65 and b <= 70
+        return b - 55
+    -1
+
+// Undo the percent-encoding of RFC 3261 section 25.1 (`%HH` is the octet).  A
+// `%` that is not followed by two hexadecimal digits stays as it is.
+//
+// ```novo
+// use sipstr
+//
+// fn main() [io]
+//     println(sipstr.unescape("a%20b%zz"))   // a b%zz
+// ```
+pub fn unescape(s: Str) -> Str
+    let n = str.len(s)
+    var out = ""
+    var i = 0
+    for _k in 0..n
+        if i >= n
+            break
+        let b = str.byte_at_or(s, i, 0)
+        let hi = hex_value(str.byte_at_or(s, i + 1, 0))
+        let lo = hex_value(str.byte_at_or(s, i + 2, 0))
+        if b == 37 and hi >= 0 and lo >= 0
+            out = out + str.from_byte(hi * 16 + lo)
+            i = i + 3
+        else
+            out = out + str.slice(s, i, i + 1)
+            i = i + 1
+    out
+
+// Whether every octet of `s` is a `token` character (RFC 3261 section 25.1)
+// and there is at least one.
+//
+// ```novo
+// use sipstr
+//
+// fn main() [io]
+//     println("${sipstr.is_token("Call-ID")} ${sipstr.is_token("a b")}")   // true false
+// ```
+pub fn is_token(s: Str) -> Bool
+    let n = str.len(s)
+    if n == 0
+        return false
+    for i in 0..n
+        let b = str.byte_at_or(s, i, 0)
+        let alnum = (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
+        let mark = b == 45 or b == 46 or b == 33 or b == 37 or b == 42 or b == 95 or b == 43 or b == 96 or b == 39 or b == 126
+        if not (alnum or mark)
+            return false
+    true
+
+// `s` without the double quotes around it and with the quoted-pairs undone,
+// or `s` as it is when it is not quoted.
+//
+// ```novo
+// use sipstr
+//
+// fn main() [io]
+//     println(sipstr.unquote("\"a\\\"b\""))   // a"b
+// ```
+pub fn unquote(s: Str) -> Str
+    let n = str.len(s)
+    if n < 2 or str.byte_at_or(s, 0, 0) != 34 or str.byte_at_or(s, n - 1, 0) != 34
+        return s
+    var out = ""
+    var i = 1
+    for _k in 0..n
+        if i >= n - 1
+            break
+        var b = str.byte_at_or(s, i, 0)
+        if b == 92 and i + 1 < n - 1
+            i = i + 1
+            b = str.byte_at_or(s, i, 0)
+        out = out + str.from_byte(b)
+        i = i + 1
+    out
+
+// `s` in double quotes, with `"` and `\` escaped.
+//
+// ```novo
+// use sipstr
+//
+// fn main() [io]
+//     println(sipstr.quote("a\"b"))   // "a\"b"
+// ```
+pub fn quote(s: Str) -> Str
+    var out = "\""
+    for i in 0..str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        if b == 34 or b == 92
+            out = out + "\\"
+        out = out + str.from_byte(b)
+    out + "\""
