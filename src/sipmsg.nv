@@ -766,6 +766,7 @@ fn once(m: SipMessage, name: Str) -> Bool
 // the first fault.
 //
 // ```novo
+// use std.bytes
 // use sipmsg
 //
 // fn main() [io]

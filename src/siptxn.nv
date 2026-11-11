@@ -1,0 +1,507 @@
+// siptxn.nv — the SIP transactions of RFC 3261 section 17, with the Accepted
+// state that RFC 6026 gives the INVITE server transaction, as steps a caller
+// drives with the time.
+//
+// A transaction is a request and the responses to it.  Four machines carry
+// them: the client and the server, each for INVITE and for everything else.
+// Each is a `SipTxn` the caller keeps in a `var`.  The caller gives it the
+// messages that arrive for it (`on_response` for a client, `on_request` for a
+// server), the responses the transaction user sends (`send_response`), and the
+// time (`tick`), and gets back a list of actions: send these octets, hand this
+// message to the transaction user, report a timeout, report that the
+// transaction has ended.  The transaction owns no socket and no clock; every
+// time is a number of milliseconds on a clock of the caller's, and
+// `next_deadline` says when the caller has to call `tick`.
+//
+// THE TIMERS.  T1 is the round-trip estimate, 500 ms; T2 is the longest
+// retransmit interval for non-INVITE requests and for INVITE responses, 4 s;
+// T4 is the longest a message stays in the network, 5 s (section 17.1.2.2 and
+// Table 4).  Over a reliable transport (TCP, TLS) the retransmission timers A,
+// E and G are not started and D, I, J and K are zero, so the transaction ends
+// at once; B, F and H still run.
+//
+//   A  INVITE request retransmit, T1 doubling         B  INVITE timeout, 64*T1
+//   D  wait for response retransmits, 32 s            E  non-INVITE retransmit, T1 up to T2
+//   F  non-INVITE timeout, 64*T1                      G  INVITE response retransmit, T1 up to T2
+//   H  wait for the ACK, 64*T1                        I  wait for ACK retransmits, T4
+//   J  wait for request retransmits, 64*T1            K  wait for response retransmits, T4
+//   L  Accepted state of the INVITE server, 64*T1 (RFC 6026)
+//
+// THE ACCEPTED STATE.  After the transaction user sends a 2xx to an INVITE the
+// server transaction does not retransmit it: the transaction user does, until
+// the ACK comes.  The transaction stays in Accepted for Timer L and hands an ACK
+// that matches it to the transaction user.  The client INVITE transaction ends
+// at the first 2xx (RFC 3261), and the 2xx that arrive afterwards are the dialog
+// layer's to ACK; RFC 6026's Timer M and the client Accepted state are not
+// implemented.
+//
+// MATCHING (sections 17.1.3 and 17.2.3).  A response belongs to the client
+// transaction with the same branch in its top Via and the same method in its
+// CSeq.  A request belongs to the server transaction with the same branch and
+// sent-by in its top Via and the same method, where an ACK counts as the INVITE.
+// Only requests whose branch begins with the magic cookie are matched; the
+// RFC 2543 rules for older peers are not implemented, and a transaction made from
+// a message with no such branch has an empty key that matches nothing.
+
+use std.bytes
+use std.str
+use sipbuild
+use sipmsg
+use sipstr
+
+// A client transaction for an INVITE.
+pub const TXN_CLIENT_INVITE = 0
+// A client transaction for any other request.
+pub const TXN_CLIENT_NONINVITE = 1
+// A server transaction for an INVITE.
+pub const TXN_SERVER_INVITE = 2
+// A server transaction for any other request.
+pub const TXN_SERVER_NONINVITE = 3
+
+// Calling (client INVITE) or Trying (non-INVITE).
+pub const TXN_INITIAL = 0
+// Proceeding.
+pub const TXN_PROCEEDING = 1
+// Completed.
+pub const TXN_COMPLETED = 2
+// Terminated.
+pub const TXN_TERMINATED = 3
+// Confirmed (server INVITE).
+pub const TXN_CONFIRMED = 4
+// Accepted (server INVITE, RFC 6026).
+pub const TXN_ACCEPTED = 5
+
+// An action: send `message` to the peer.
+pub const ACT_SEND = 1
+// An action: hand `message` to the transaction user.
+pub const ACT_DELIVER = 2
+// An action: the transaction timed out (B, F or H).
+pub const ACT_TIMEOUT = 3
+// An action: the transaction has ended.
+pub const ACT_TERMINATED = 4
+
+// The default T1 in milliseconds.
+pub const SIP_T1 = 500
+// The default T2 in milliseconds.
+pub const SIP_T2 = 4000
+// The default T4 in milliseconds.
+pub const SIP_T4 = 5000
+// Timer D for an unreliable transport, in milliseconds.
+pub const SIP_TIMER_D = 32000
+
+// What a transaction asks its caller to do.
+pub struct SipAction
+    // An `ACT_` value.
+    kind: Int
+    // The message to send or deliver; the request for the other kinds.
+    message: SipMessage
+
+// A transaction.
+pub struct SipTxn
+    kind: Int
+    var state: Int
+    reliable: Bool
+    t1: Int
+    t2: Int
+    t4: Int
+    // The matching key.
+    key: Str
+    // The request: sent by a client, received by a server.
+    request: SipMessage
+    // The last message sent: the request, the ACK, or the last response.
+    var last: SipMessage
+    // Whether a response has been sent (server) or received (client).
+    var answered: Bool
+    // The current retransmit interval.
+    var interval: Int
+    // When to retransmit (A, E, G), or -1.
+    var retx_at: Int
+    // When to give up (B, F, H), or -1.
+    var timeout_at: Int
+    // When to end (D, I, J, K, L), or -1.
+    var end_at: Int
+
+// The branch and the sent-by of the top Via, and the method, as a key.
+fn key_of(m: SipMessage, method: Str, with_sent_by: Bool) -> Str
+    let vias = sipmsg.via_list(m)
+    if list.len(vias) == 0
+        return ""
+    let v = vias[0]
+    let branch = sipmsg.via_branch(v)
+    if not sipmsg.branch_is_rfc3261(branch)
+        return ""
+    if with_sent_by
+        return branch + "|" + str.lower(v.host) + ":" + str.from_int(v.port) + "|" + method
+    branch + "|" + method
+
+// The key a response is matched by (section 17.1.3): the branch of its top Via
+// and the method of its CSeq.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+// use siptxn
+//
+// fn main() [io]
+//     let r = sipmsg.response(200, "OK", [sipmsg.header_of("Via", "SIP/2.0/UDP h;branch=z9hG4bKa"), sipmsg.header_of("CSeq", "1 INVITE")], bytes.from_str(""))
+//     println(siptxn.response_key(r))   // z9hG4bKa|INVITE
+// ```
+pub fn response_key(resp: SipMessage) -> Str
+    match sipmsg.cseq(resp)
+        Err(_) => ""
+        Ok(c)  => key_of(resp, c.method, false)
+
+// The key a request is matched by (section 17.2.3): the branch and sent-by of
+// its top Via and its method, an ACK counting as the INVITE.  "" for a request
+// whose branch does not begin with the magic cookie.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+// use siptxn
+//
+// fn main() [io]
+//     let r = sipmsg.request("ACK", "sip:b@c", [sipmsg.header_of("Via", "SIP/2.0/UDP Host:5060;branch=z9hG4bKa")], bytes.from_str(""))
+//     println(siptxn.request_key(r))   // z9hG4bKa|host:5060|INVITE
+// ```
+pub fn request_key(req: SipMessage) -> Str
+    var method = req.method
+    if method == "ACK"
+        method = "INVITE"
+    key_of(req, method, true)
+
+// A transaction of the kind `kind` for `request`.
+fn make(kind: Int, request: SipMessage, reliable: Bool, key: Str) -> SipTxn
+    SipTxn { kind: kind, state: TXN_INITIAL, reliable: reliable, t1: SIP_T1, t2: SIP_T2, t4: SIP_T4, key: key,
+             request: request, last: request, answered: false, interval: SIP_T1, retx_at: -1, timeout_at: -1,
+             end_at: -1 }
+
+// A client transaction for a request the transaction user wants sent.  Call
+// `start` to send it.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+// use siptxn
+//
+// fn main() [io]
+//     let req = sipmsg.request("OPTIONS", "sip:b@c", [sipmsg.header_of("Via", "SIP/2.0/UDP h;branch=z9hG4bKa"), sipmsg.header_of("CSeq", "1 OPTIONS")], bytes.from_str(""))
+//     let t = siptxn.client_new(req, false)
+//     println("${t.kind} ${t.state} ${t.key}")   // 1 0 z9hG4bKa|OPTIONS
+// ```
+pub fn client_new(request: SipMessage, reliable: Bool) -> SipTxn
+    var kind = TXN_CLIENT_NONINVITE
+    if request.method == "INVITE"
+        kind = TXN_CLIENT_INVITE
+    make(kind, request, reliable, key_of(request, request.method, false))
+
+// A server transaction for a request received.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+// use siptxn
+//
+// fn main() [io]
+//     let req = sipmsg.request("INVITE", "sip:b@c", [sipmsg.header_of("Via", "SIP/2.0/UDP h:5060;branch=z9hG4bKa")], bytes.from_str(""))
+//     let t = siptxn.server_new(req, false)
+//     println("${t.kind} ${t.key}")   // 2 z9hG4bKa|h:5060|INVITE
+// ```
+pub fn server_new(request: SipMessage, reliable: Bool) -> SipTxn
+    var kind = TXN_SERVER_NONINVITE
+    if request.method == "INVITE"
+        kind = TXN_SERVER_INVITE
+    var state = TXN_INITIAL
+    if kind == TXN_SERVER_INVITE
+        state = TXN_PROCEEDING
+    var t = make(kind, request, reliable, request_key(request))
+    t.state = state
+    t
+
+fn action(kind: Int, m: SipMessage) -> SipAction
+    SipAction { kind: kind, message: m }
+
+// End the transaction.
+fn finish(var t: SipTxn, var acts: [SipAction]) []
+    t.state = TXN_TERMINATED
+    t.retx_at = -1
+    t.timeout_at = -1
+    t.end_at = -1
+    list.push(acts, action(ACT_TERMINATED, t.request))
+
+// Send the request of a client transaction and start its timers (Timer A and B,
+// or E and F).  Answers the action that sends it.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+// use siptxn
+//
+// fn main() [io]
+//     let req = sipmsg.request("INVITE", "sip:b@c", [sipmsg.header_of("Via", "SIP/2.0/UDP h;branch=z9hG4bKa"), sipmsg.header_of("CSeq", "1 INVITE")], bytes.from_str(""))
+//     var t = siptxn.client_new(req, false)
+//     let acts = siptxn.start(var t, 1000)
+//     println("${list.len(acts)} ${acts[0].kind} ${siptxn.next_deadline(t)}")   // 1 1 1500
+// ```
+pub fn start(var t: SipTxn, now: Int) -> [SipAction]
+    var acts: [SipAction] = []
+    list.push(acts, action(ACT_SEND, t.request))
+    t.interval = t.t1
+    if not t.reliable
+        t.retx_at = now + t.t1
+    t.timeout_at = now + 64 * t.t1
+    acts
+
+// The earliest time at which `tick` has something to do, or -1.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+// use siptxn
+//
+// fn main() [io]
+//     let req = sipmsg.request("OPTIONS", "sip:b@c", [sipmsg.header_of("Via", "SIP/2.0/UDP h;branch=z9hG4bKa")], bytes.from_str(""))
+//     let t = siptxn.client_new(req, false)
+//     println("${siptxn.next_deadline(t)}")   // -1
+// ```
+pub fn next_deadline(t: SipTxn) -> Int
+    var best = -1
+    for x in [t.retx_at, t.timeout_at, t.end_at]
+        if x >= 0 and (best < 0 or x < best)
+            best = x
+    best
+
+// Whether a response belongs to a client transaction.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+// use siptxn
+//
+// fn main() [io]
+//     let req = sipmsg.request("OPTIONS", "sip:b@c", [sipmsg.header_of("Via", "SIP/2.0/UDP h;branch=z9hG4bKa")], bytes.from_str(""))
+//     let t = siptxn.client_new(req, false)
+//     let r = sipmsg.response(200, "OK", [sipmsg.header_of("Via", "SIP/2.0/UDP h;branch=z9hG4bKa"), sipmsg.header_of("CSeq", "1 OPTIONS")], bytes.from_str(""))
+//     println("${siptxn.matches_response(t, r)}")   // true
+// ```
+pub fn matches_response(t: SipTxn, resp: SipMessage) -> Bool
+    str.len(t.key) > 0 and response_key(resp) == t.key
+
+// Whether a request belongs to a server transaction: a retransmission of its
+// request, or the ACK of its INVITE.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+// use siptxn
+//
+// fn main() [io]
+//     let req = sipmsg.request("INVITE", "sip:b@c", [sipmsg.header_of("Via", "SIP/2.0/UDP h:5060;branch=z9hG4bKa")], bytes.from_str(""))
+//     let t = siptxn.server_new(req, false)
+//     let ack = sipmsg.request("ACK", "sip:b@c", [sipmsg.header_of("Via", "SIP/2.0/UDP h:5060;branch=z9hG4bKa")], bytes.from_str(""))
+//     println("${siptxn.matches_request(t, ack)}")   // true
+// ```
+pub fn matches_request(t: SipTxn, req: SipMessage) -> Bool
+    str.len(t.key) > 0 and request_key(req) == t.key
+
+// A response arrives for a client transaction.  Answers the actions to take.
+// A response that does not belong to it is ignored.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+// use siptxn
+//
+// fn main() [io]
+//     let via = sipmsg.header_of("Via", "SIP/2.0/UDP h;branch=z9hG4bKa")
+//     let req = sipmsg.request("OPTIONS", "sip:b@c", [via, sipmsg.header_of("CSeq", "1 OPTIONS")], bytes.from_str(""))
+//     var t = siptxn.client_new(req, false)
+//     let _ = siptxn.start(var t, 0)
+//     let ok = sipmsg.response(200, "OK", [via, sipmsg.header_of("CSeq", "1 OPTIONS")], bytes.from_str(""))
+//     let acts = siptxn.on_response(var t, ok, 100)
+//     println("${acts[0].kind} ${t.state}")   // 2 2
+// ```
+pub fn on_response(var t: SipTxn, resp: SipMessage, now: Int) -> [SipAction]
+    var acts: [SipAction] = []
+    if not matches_response(t, resp) or t.state == TXN_TERMINATED
+        return acts
+    if t.kind == TXN_CLIENT_INVITE
+        if t.state == TXN_COMPLETED
+            // A retransmitted final response: the ACK again.
+            if resp.status >= 300
+                list.push(acts, action(ACT_SEND, t.last))
+            return acts
+        if resp.status < 200
+            t.state = TXN_PROCEEDING
+            t.retx_at = -1
+            t.timeout_at = -1
+            list.push(acts, action(ACT_DELIVER, resp))
+            return acts
+        if resp.status < 300
+            list.push(acts, action(ACT_DELIVER, resp))
+            finish(var t, var acts)
+            return acts
+        t.last = sipbuild.ack_for_non2xx(t.request, resp)
+        t.answered = true
+        t.state = TXN_COMPLETED
+        t.retx_at = -1
+        t.timeout_at = -1
+        list.push(acts, action(ACT_SEND, t.last))
+        list.push(acts, action(ACT_DELIVER, resp))
+        if t.reliable
+            finish(var t, var acts)
+        else
+            t.end_at = now + SIP_TIMER_D
+        return acts
+    // A non-INVITE client transaction.
+    if t.state == TXN_COMPLETED
+        return acts
+    if resp.status < 200
+        t.state = TXN_PROCEEDING
+        t.interval = t.t2
+        if not t.reliable
+            t.retx_at = now + t.t2
+        list.push(acts, action(ACT_DELIVER, resp))
+        return acts
+    t.answered = true
+    t.state = TXN_COMPLETED
+    t.retx_at = -1
+    t.timeout_at = -1
+    list.push(acts, action(ACT_DELIVER, resp))
+    if t.reliable
+        finish(var t, var acts)
+    else
+        t.end_at = now + t.t4
+    acts
+
+// A request arrives for a server transaction: the request again, or the ACK
+// of an INVITE.  Answers the actions to take.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+// use siptxn
+//
+// fn main() [io]
+//     let via = sipmsg.header_of("Via", "SIP/2.0/UDP h:5060;branch=z9hG4bKa")
+//     let req = sipmsg.request("OPTIONS", "sip:b@c", [via], bytes.from_str(""))
+//     var t = siptxn.server_new(req, false)
+//     let _ = siptxn.send_response(var t, sipmsg.response(200, "OK", [via], bytes.from_str("")), 0)
+//     let acts = siptxn.on_request(var t, req, 50)
+//     println("${list.len(acts)} ${acts[0].kind}")   // 1 1
+// ```
+pub fn on_request(var t: SipTxn, req: SipMessage, now: Int) -> [SipAction]
+    var acts: [SipAction] = []
+    if not matches_request(t, req) or t.state == TXN_TERMINATED
+        return acts
+    if req.method == "ACK"
+        if t.kind != TXN_SERVER_INVITE
+            return acts
+        if t.state == TXN_ACCEPTED
+            list.push(acts, action(ACT_DELIVER, req))
+        elif t.state == TXN_COMPLETED
+            t.state = TXN_CONFIRMED
+            t.retx_at = -1
+            t.timeout_at = -1
+            if t.reliable
+                finish(var t, var acts)
+            else
+                t.end_at = now + t.t4
+        return acts
+    // A retransmission of the request: the last response again, if there is one.
+    if t.state == TXN_ACCEPTED or t.state == TXN_CONFIRMED
+        return acts
+    if not t.last.is_request
+        list.push(acts, action(ACT_SEND, t.last))
+    acts
+
+// The transaction user sends a response through a server transaction.  Answers
+// the actions to take.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+// use siptxn
+//
+// fn main() [io]
+//     let via = sipmsg.header_of("Via", "SIP/2.0/UDP h:5060;branch=z9hG4bKa")
+//     let req = sipmsg.request("INVITE", "sip:b@c", [via], bytes.from_str(""))
+//     var t = siptxn.server_new(req, false)
+//     let acts = siptxn.send_response(var t, sipmsg.response(200, "OK", [via], bytes.from_str("")), 0)
+//     println("${t.state} ${siptxn.next_deadline(t)}")   // 5 32000
+// ```
+pub fn send_response(var t: SipTxn, resp: SipMessage, now: Int) -> [SipAction]
+    var acts: [SipAction] = []
+    if t.state == TXN_TERMINATED or t.state == TXN_CONFIRMED
+        return acts
+    if t.kind == TXN_SERVER_INVITE
+        if t.state == TXN_ACCEPTED
+            list.push(acts, action(ACT_SEND, resp))
+            return acts
+        if t.state != TXN_PROCEEDING
+            return acts
+        t.last = resp
+        list.push(acts, action(ACT_SEND, resp))
+        if resp.status < 200
+            return acts
+        t.answered = true
+        if resp.status < 300
+            t.state = TXN_ACCEPTED
+            t.end_at = now + 64 * t.t1
+            return acts
+        t.state = TXN_COMPLETED
+        t.interval = t.t1
+        if not t.reliable
+            t.retx_at = now + t.t1
+        t.timeout_at = now + 64 * t.t1
+        return acts
+    if t.state == TXN_COMPLETED
+        return acts
+    t.last = resp
+    list.push(acts, action(ACT_SEND, resp))
+    if resp.status < 200
+        t.state = TXN_PROCEEDING
+        return acts
+    t.answered = true
+    t.state = TXN_COMPLETED
+    if t.reliable
+        finish(var t, var acts)
+    else
+        t.end_at = now + 64 * t.t1
+    acts
+
+// The time `now` has come: run the timers that are due.  Answers the actions
+// to take.
+//
+// ```novo
+// use std.bytes
+// use sipmsg
+// use siptxn
+//
+// fn main() [io]
+//     let req = sipmsg.request("OPTIONS", "sip:b@c", [sipmsg.header_of("Via", "SIP/2.0/UDP h;branch=z9hG4bKa")], bytes.from_str(""))
+//     var t = siptxn.client_new(req, false)
+//     let _ = siptxn.start(var t, 0)
+//     println("${list.len(siptxn.tick(var t, 500))} ${list.len(siptxn.tick(var t, 32000))}")   // 1 2
+// ```
+pub fn tick(var t: SipTxn, now: Int) -> [SipAction]
+    var acts: [SipAction] = []
+    if t.state == TXN_TERMINATED
+        return acts
+    if t.end_at >= 0 and now >= t.end_at
+        finish(var t, var acts)
+        return acts
+    if t.timeout_at >= 0 and now >= t.timeout_at
+        list.push(acts, action(ACT_TIMEOUT, t.request))
+        finish(var t, var acts)
+        return acts
+    if t.retx_at >= 0 and now >= t.retx_at
+        list.push(acts, action(ACT_SEND, t.last))
+        // Timer A doubles without limit; E and G stop doubling at T2.
+        t.interval = t.interval * 2
+        if t.kind != TXN_CLIENT_INVITE and t.interval > t.t2
+            t.interval = t.t2
+        if t.kind == TXN_CLIENT_NONINVITE and t.state == TXN_PROCEEDING
+            t.interval = t.t2
+        t.retx_at = now + t.interval
+    acts

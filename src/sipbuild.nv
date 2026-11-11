@@ -1,0 +1,192 @@
+// sipbuild.nv — forming requests and responses, RFC 3261 sections 8.1, 8.2,
+// 9.1 and 17.1.1.3.
+//
+// A request that starts a dialog or stands alone (section 8.1.1) has a
+// Request-URI and the headers To, From, CSeq, Call-ID, Max-Forwards and Via;
+// a Contact where a dialog is made; and a Route header for each element of
+// a pre-loaded route.  A response (section 8.2.6.2) repeats the Via headers,
+// From, Call-ID and CSeq of the request, and the To of the request with a tag
+// added when it has none.  The ACK of a final response other than 2xx is formed
+// from the INVITE and the response (section 17.1.1.3), and the CANCEL from the
+// INVITE (section 9.1).  The ACK of a 2xx belongs to the dialog and is formed in
+// `sipdialog`.
+//
+// The package has no source of randomness and no clock, so the tag, the
+// branch and the Call-ID arrive as arguments.
+
+use std.bytes
+use std.str
+use siperr
+use sipmsg
+use sipstr
+use sipuri
+
+// A branch parameter: the magic cookie and `token`, which the caller makes
+// unique for each transaction (section 8.1.1.7).
+//
+// ```novo
+// use sipbuild
+//
+// fn main() [io]
+//     println(sipbuild.new_branch("776asdhds"))   // z9hG4bK776asdhds
+// ```
+pub fn new_branch(token: Str) -> Str
+    SIP_MAGIC + token
+
+// `value`, an address, with `;tag=` added when it has no tag.
+//
+// ```novo
+// use sipbuild
+//
+// fn main() [io]
+//     println(sipbuild.with_tag("<sip:bob@biloxi.example>", "a6c85cf"))   // <sip:bob@biloxi.example>;tag=a6c85cf
+// ```
+pub fn with_tag(value: Str, tag: Str) -> Str
+    match sipuri.parse_addr(value)
+        Err(_) => value + ";tag=" + tag
+        Ok(a)  =>
+            if sipuri.has_param(a.params, "tag")
+                value
+            else
+                value + ";tag=" + tag
+
+// A request, formed as section 8.1.1 asks.  `to` and `from` are the values of
+// the headers (the caller puts the tag in `from`), `routes` the Route values in
+// order, and `contact` the value of a Contact header or "" for none.
+//
+// ```novo
+// use sipbuild
+// use sipmsg
+//
+// fn main() [io]
+//     let via = sipmsg.new_via("UDP", "pc33.atlanta.example", -1, sipbuild.new_branch("776"))
+//     let m = sipbuild.new_request("INVITE", "sip:bob@biloxi.example", "<sip:bob@biloxi.example>", "<sip:alice@atlanta.example>;tag=1928", "a84b4c", 1, via, "<sip:alice@pc33.atlanta.example>", 70, [])
+//     println("${m.method} ${sipmsg.header_value(m, "CSeq") ?? "-"} ${list.len(m.headers)}")   // INVITE 1 INVITE 7
+// ```
+pub fn new_request(method: Str, request_uri: Str, to: Str, from: Str, call_id: Str, cseq: Int, via: SipVia,
+                   contact: Str, max_forwards: Int, routes: [Str]) -> SipMessage
+    var hs: [SipHeader] = []
+    for r in routes
+        list.push(hs, sipmsg.header_of("Route", r))
+    list.push(hs, sipmsg.header_of("Via", sipmsg.write_via(via)))
+    list.push(hs, sipmsg.header_of("Max-Forwards", str.from_int(max_forwards)))
+    list.push(hs, sipmsg.header_of("To", to))
+    list.push(hs, sipmsg.header_of("From", from))
+    list.push(hs, sipmsg.header_of("Call-ID", call_id))
+    list.push(hs, sipmsg.header_of("CSeq", str.from_int(cseq) + " " + method))
+    if str.len(contact) > 0
+        list.push(hs, sipmsg.header_of("Contact", contact))
+    sipmsg.request(method, request_uri, hs, bytes.from_str(""))
+
+// A response to `req`, formed as section 8.2.6.2 asks: the Via headers, From,
+// Call-ID, CSeq and the Record-Route headers of the request, and its To with
+// `to_tag` added when the request's To has no tag and the status is not 100.
+// An empty `reason` is the phrase RFC 3261 suggests for the status.
+//
+// ```novo
+// use sipbuild
+// use sipmsg
+//
+// fn main() [io]
+//     let via = sipmsg.new_via("UDP", "h", -1, sipbuild.new_branch("1"))
+//     let req = sipbuild.new_request("OPTIONS", "sip:b@c", "<sip:b@c>", "<sip:a@d>;tag=1", "x", 1, via, "", 70, [])
+//     let r = sipbuild.new_response(req, 200, "", "9fxced76sl")
+//     println("${r.status} ${r.reason} ${sipmsg.header_value(r, "To") ?? "-"}")   // 200 OK <sip:b@c>;tag=9fxced76sl
+// ```
+pub fn new_response(req: SipMessage, status: Int, reason: Str, to_tag: Str) -> SipMessage
+    var hs: [SipHeader] = []
+    for v in sipmsg.header_values(req, "Via")
+        list.push(hs, sipmsg.header_of("Via", v))
+    for v in sipmsg.header_values(req, "Record-Route")
+        list.push(hs, sipmsg.header_of("Record-Route", v))
+    var to = sipmsg.header_value(req, "To") ?? ""
+    if status != 100 and str.len(to_tag) > 0
+        to = with_tag(to, to_tag)
+    list.push(hs, sipmsg.header_of("To", to))
+    list.push(hs, sipmsg.header_of("From", sipmsg.header_value(req, "From") ?? ""))
+    list.push(hs, sipmsg.header_of("Call-ID", sipmsg.header_value(req, "Call-ID") ?? ""))
+    list.push(hs, sipmsg.header_of("CSeq", sipmsg.header_value(req, "CSeq") ?? ""))
+    var phrase = reason
+    if str.len(phrase) == 0
+        phrase = sipmsg.reason_of(status)
+    sipmsg.response(status, phrase, hs, bytes.from_str(""))
+
+// The ACK for a final response other than 2xx to `invite` (section 17.1.1.3):
+// the Request-URI, Call-ID, From, Route headers and top Via of the INVITE, the
+// To of the response, and the CSeq number of the INVITE with the method ACK.
+//
+// ```novo
+// use sipbuild
+// use sipmsg
+//
+// fn main() [io]
+//     let via = sipmsg.new_via("UDP", "h", -1, sipbuild.new_branch("1"))
+//     let inv = sipbuild.new_request("INVITE", "sip:b@c", "<sip:b@c>", "<sip:a@d>;tag=1", "x", 7, via, "", 70, [])
+//     let busy = sipbuild.new_response(inv, 486, "", "t2")
+//     let ack = sipbuild.ack_for_non2xx(inv, busy)
+//     println("${ack.method} ${sipmsg.header_value(ack, "CSeq") ?? "-"} ${sipmsg.header_value(ack, "To") ?? "-"}")   // ACK 7 ACK <sip:b@c>;tag=t2
+// ```
+pub fn ack_for_non2xx(invite: SipMessage, resp: SipMessage) -> SipMessage
+    var hs: [SipHeader] = []
+    for v in sipmsg.header_values(invite, "Route")
+        list.push(hs, sipmsg.header_of("Route", v))
+    let vias = sipmsg.header_values(invite, "Via")
+    list.push(hs, sipmsg.header_of("Via", vias[0]))
+    list.push(hs, sipmsg.header_of("Max-Forwards", "70"))
+    list.push(hs, sipmsg.header_of("To", sipmsg.header_value(resp, "To") ?? ""))
+    list.push(hs, sipmsg.header_of("From", sipmsg.header_value(invite, "From") ?? ""))
+    list.push(hs, sipmsg.header_of("Call-ID", sipmsg.header_value(invite, "Call-ID") ?? ""))
+    let seq = sipmsg.cseq(invite)!
+    list.push(hs, sipmsg.header_of("CSeq", str.from_int(seq.seq) + " ACK"))
+    sipmsg.request("ACK", invite.uri, hs, bytes.from_str(""))
+
+// The CANCEL for `invite` (section 9.1): the Request-URI, Call-ID, To, From and
+// Route headers and the single top Via of the INVITE, and its CSeq number with
+// the method CANCEL.  It has no body.
+//
+// ```novo
+// use sipbuild
+// use sipmsg
+//
+// fn main() [io]
+//     let via = sipmsg.new_via("UDP", "h", -1, sipbuild.new_branch("1"))
+//     let inv = sipbuild.new_request("INVITE", "sip:b@c", "<sip:b@c>", "<sip:a@d>;tag=1", "x", 7, via, "", 70, [])
+//     println(sipmsg.header_value(sipbuild.cancel_for(inv), "CSeq") ?? "-")   // 7 CANCEL
+// ```
+pub fn cancel_for(invite: SipMessage) -> SipMessage
+    var hs: [SipHeader] = []
+    for v in sipmsg.header_values(invite, "Route")
+        list.push(hs, sipmsg.header_of("Route", v))
+    let vias = sipmsg.header_values(invite, "Via")
+    list.push(hs, sipmsg.header_of("Via", vias[0]))
+    list.push(hs, sipmsg.header_of("Max-Forwards", "70"))
+    list.push(hs, sipmsg.header_of("To", sipmsg.header_value(invite, "To") ?? ""))
+    list.push(hs, sipmsg.header_of("From", sipmsg.header_value(invite, "From") ?? ""))
+    list.push(hs, sipmsg.header_of("Call-ID", sipmsg.header_value(invite, "Call-ID") ?? ""))
+    let seq = sipmsg.cseq(invite)!
+    list.push(hs, sipmsg.header_of("CSeq", str.from_int(seq.seq) + " CANCEL"))
+    sipmsg.request("CANCEL", invite.uri, hs, bytes.from_str(""))
+
+// The status a server answers a request with before it looks at what it asks,
+// from the checks of `validate` and section 8.2.1: 0 when the request may go
+// on, 400 for a request that is not well formed, 483 when Max-Forwards is 0 and
+// the element is a proxy (`proxy` true), and 505 for a version other than 2.0.
+//
+// ```novo
+// use sipbuild
+// use sipmsg
+//
+// fn main() [io]
+//     let via = sipmsg.new_via("UDP", "h", -1, sipbuild.new_branch("1"))
+//     let req = sipbuild.new_request("OPTIONS", "sip:b@c", "<sip:b@c>", "<sip:a@d>;tag=1", "x", 1, via, "", 0, [])
+//     println("${sipbuild.request_status(req, true)} ${sipbuild.request_status(req, false)}")   // 483 0
+// ```
+pub fn request_status(req: SipMessage, proxy: Bool) -> Int
+    if str.lower(req.version) != "sip/2.0"
+        return 505
+    match sipmsg.validate(req)
+        Err(_) => return 400
+        Ok(_)  => 0
+    if proxy and (sipmsg.header_value(req, "Max-Forwards") ?? "1") == "0"
+        return 483
+    0

@@ -1,0 +1,307 @@
+// sipauth.nv — digest authentication for SIP, RFC 3261 section 22 with
+// RFC 7616 and RFC 8760.
+//
+// A server challenges a request with 401 and `WWW-Authenticate`, or a proxy
+// with 407 and `Proxy-Authenticate`; the client repeats the request with
+// `Authorization` or `Proxy-Authorization` carrying a digest of the user name,
+// the realm, the password, the nonce and the request.  RFC 7616 names the hash
+// functions and RFC 8760 adds SHA-512/256:
+//
+//   MD5, SHA-256, SHA-512-256     and each with the suffix `-sess`
+//
+//   HA1      = H(username ":" realm ":" password)
+//              for `-sess`: H(HA1 ":" nonce ":" cnonce)
+//   HA2      = H(method ":" digest-uri)
+//   response = H(HA1 ":" nonce ":" nc ":" cnonce ":" qop ":" HA2)    with qop
+//            = H(HA1 ":" nonce ":" HA2)                                without
+//
+// `nc` is the nonce count, eight lower-case hexadecimal digits, and `cnonce`
+// is a nonce the client chooses; the caller supplies it, because this package
+// has no source of randomness.  The qop `auth-int` hashes the body into HA2
+// and is not implemented; a challenge that offers only it is refused.
+//
+// MD5 is here because RFC 3261 requires it of a server and many peers offer
+// nothing else.  A client that has the choice takes the strongest algorithm
+// among the challenges it received.
+
+use std.bytes
+use std.str
+use hashing
+use sha512_core
+use siperr
+use sipstr
+
+// A challenge.
+pub struct SipChallenge
+    // `Digest`, or the scheme as written.
+    scheme: Str
+    realm: Str
+    nonce: Str
+    opaque: Str
+    // The algorithm as written; "MD5" when the challenge names none.
+    algorithm: Str
+    // The qop values offered, as written; empty for an RFC 2069 challenge.
+    qop: [Str]
+    stale: Bool
+    // Whether the challenge came in a Proxy-Authenticate header.
+    proxy: Bool
+
+// The credentials of an Authorization or Proxy-Authorization header.
+pub struct SipCredentials
+    username: Str
+    realm: Str
+    nonce: Str
+    uri: Str
+    response: Str
+    algorithm: Str
+    cnonce: Str
+    // "auth", or "" when the response has no qop.
+    qop: Str
+    nc: Int
+    opaque: Str
+
+// The names of the hash functions this package computes, in the order of
+// preference of RFC 7616 section 3.7: strongest first.
+//
+// ```novo
+// use sipauth
+//
+// fn main() [io]
+//     println("${sipauth.algorithms()[0]}")   // SHA-512-256
+// ```
+pub fn algorithms() -> [Str]
+    ["SHA-512-256", "SHA-256", "MD5"]
+
+// The hex digest of `s` under the hash function of `algorithm`, with or without
+// `-sess`.  Answers `SipBadAuth` for a name that is not one of the three.
+//
+// ```novo
+// use sipauth
+//
+// fn main() [io]
+//     println(sipauth.hash_hex("MD5", "abc")!)   // 900150983cd24fb0d6963f7d28e17f72
+// ```
+pub fn hash_hex(algorithm: Str, s: Str) -> Result<Str, SipError>
+    let a = str.upper(algorithm)
+    let base = if str.ends_with(a, "-SESS")
+        str.slice(a, 0, str.len(a) - 5)
+    else
+        a
+    let data = bytes.from_str(s)
+    if base == "MD5"
+        return Ok(bytes.to_hex(hashing.md5(data)))
+    if base == "SHA-256"
+        return Ok(bytes.to_hex(hashing.sha256(data)))
+    if base == "SHA-512-256"
+        // FIPS 180-4 section 5.3.6.2: SHA-512 from another initial value, cut to 32 octets.
+        let st = sha512_core.Sha512 { h0: 2463787394917988140, h1: -6965556091613846334, h2: 2563595384472711505,
+                                      h3: -7622211418569250115, h4: -7626776825740460061, h5: -4729309413028513390,
+                                      h6: 3098927326965381290, h7: 1060366662362279074, len: 0 }
+        let full = hashing.sha512_finish(st, data, bytes.zeros(64))
+        return Ok(bytes.to_hex(bytes.slice(full, 0, 32)))
+    Err(SipBadAuth("algorithm " + algorithm))
+
+// Eight lower-case hexadecimal digits.
+fn hex8(n: Int) -> Str
+    let h = "0123456789abcdef"
+    var out = ""
+    for i in 0..8
+        let shift = (7 - i) * 4
+        let d = (n >> shift) & 15
+        out = out + str.slice(h, d, d + 1)
+    out
+
+// The digest `response` of RFC 7616 section 3.4.1 for a request.  `qop` is
+// "auth" or "" (RFC 2069 form); `cnonce` and `nc` are ignored without a qop,
+// except by a `-sess` algorithm, which needs `cnonce`.
+//
+// ```novo
+// use sipauth
+//
+// fn main() [io]
+//     let r = sipauth.digest_response("MD5", "Mufasa", "http-auth@example.org", "Circle of Life", "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", "GET", "/dir/index.html", "auth", "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ", 1)!
+//     println(r)   // 8ca523f5e9506fed4657c9700eebdbec
+// ```
+pub fn digest_response(algorithm: Str, username: Str, realm: Str, password: Str, nonce: Str, method: Str,
+                       uri: Str, qop: Str, cnonce: Str, nc: Int) -> Result<Str, SipError>
+    if qop != "" and qop != "auth"
+        return Err(SipBadAuth("qop " + qop))
+    var ha1 = hash_hex(algorithm, username + ":" + realm + ":" + password)!
+    if str.ends_with(str.upper(algorithm), "-SESS")
+        ha1 = hash_hex(algorithm, ha1 + ":" + nonce + ":" + cnonce)!
+    let ha2 = hash_hex(algorithm, method + ":" + uri)!
+    if qop == ""
+        return hash_hex(algorithm, ha1 + ":" + nonce + ":" + ha2)
+    hash_hex(algorithm, ha1 + ":" + nonce + ":" + hex8(nc) + ":" + cnonce + ":" + qop + ":" + ha2)
+
+// The value of a parameter in a list of `name=value` pieces, unquoted.
+fn field(pieces: [Str], name: Str) -> Str
+    for p in pieces
+        match str.index(p, "=")
+            None     => 0
+            Some(eq) =>
+                if sipstr.eq_ci(str.trim(str.slice(p, 0, eq)), name)
+                    return sipstr.unquote(str.trim(str.slice(p, eq + 1, str.len(p))))
+    ""
+
+// Whether a parameter is present.
+fn has_field(pieces: [Str], name: Str) -> Bool
+    for p in pieces
+        let eq = str.index(p, "=") ?? str.len(p)
+        if sipstr.eq_ci(str.trim(str.slice(p, 0, eq)), name)
+            return true
+    false
+
+// Read a challenge from a WWW-Authenticate or Proxy-Authenticate value.
+// `proxy` says which header it came from.  Answers `SipBadAuth` when the
+// scheme is not Digest or the realm or the nonce is missing.
+//
+// ```novo
+// use sipauth
+//
+// fn main() [io]
+//     let c = sipauth.parse_challenge("Digest realm=\"atlanta.example\", nonce=\"84f1c1ae\", algorithm=SHA-256, qop=\"auth,auth-int\"", false)!
+//     println("${c.realm} ${c.algorithm} ${list.len(c.qop)}")   // atlanta.example SHA-256 2
+// ```
+pub fn parse_challenge(value: Str, proxy: Bool) -> Result<SipChallenge, SipError>
+    let t = str.trim(value)
+    let sp = str.index(t, " ") ?? -1
+    if sp < 1 or not sipstr.eq_ci(str.slice(t, 0, sp), "Digest")
+        return Err(SipBadAuth(value))
+    let pieces = sipstr.split_top(str.slice(t, sp + 1, str.len(t)), 44)
+    let realm = field(pieces, "realm")
+    let nonce = field(pieces, "nonce")
+    if not has_field(pieces, "realm") or not has_field(pieces, "nonce")
+        return Err(SipBadAuth(value))
+    var algorithm = field(pieces, "algorithm")
+    if algorithm == ""
+        algorithm = "MD5"
+    var qop: [Str] = []
+    for q in str.split(field(pieces, "qop"), ",")
+        if str.len(str.trim(q)) > 0
+            list.push(qop, str.trim(q))
+    Ok(SipChallenge { scheme: "Digest", realm: realm, nonce: nonce, opaque: field(pieces, "opaque"),
+                      algorithm: algorithm, qop: qop, stale: sipstr.eq_ci(field(pieces, "stale"), "true"),
+                      proxy: proxy })
+
+// Whether the challenge offers the qop `auth`.
+//
+// ```novo
+// use sipauth
+//
+// fn main() [io]
+//     let c = sipauth.parse_challenge("Digest realm=\"r\", nonce=\"n\", qop=\"auth\"", false)!
+//     println("${sipauth.offers_auth(c)}")   // true
+// ```
+pub fn offers_auth(c: SipChallenge) -> Bool
+    for q in c.qop
+        if sipstr.eq_ci(q, "auth")
+            return true
+    false
+
+// Answer a challenge for a request: the credentials for `username` and
+// `password`, for `method` and the Request-URI `uri`.  `cnonce` is a nonce the
+// caller chose and `nc` counts the uses of this nonce, from 1.  The qop is
+// `auth` when the challenge offers it; a challenge that offers qop values but
+// not `auth` is refused, and one that offers none is answered in the RFC 2069
+// form.
+//
+// ```novo
+// use sipauth
+//
+// fn main() [io]
+//     let c = sipauth.parse_challenge("Digest realm=\"r\", nonce=\"n\", qop=\"auth\"", false)!
+//     let cr = sipauth.answer(c, "alice", "secret", "REGISTER", "sip:r", "cn", 1)!
+//     println("${cr.qop} ${cr.nc} ${str.len(cr.response)}")   // auth 1 32
+// ```
+pub fn answer(c: SipChallenge, username: Str, password: Str, method: Str, uri: Str, cnonce: Str,
+              nc: Int) -> Result<SipCredentials, SipError>
+    var qop = ""
+    if list.len(c.qop) > 0
+        if not offers_auth(c)
+            return Err(SipBadAuth("qop " + str.join(c.qop, ",")))
+        qop = "auth"
+    let r = digest_response(c.algorithm, username, c.realm, password, c.nonce, method, uri, qop, cnonce, nc)!
+    Ok(SipCredentials { username: username, realm: c.realm, nonce: c.nonce, uri: uri, response: r,
+                        algorithm: c.algorithm, cnonce: cnonce, qop: qop, nc: nc, opaque: c.opaque })
+
+// The value of an Authorization or Proxy-Authorization header for credentials.
+//
+// ```novo
+// use std.str
+// use sipauth
+//
+// fn main() [io]
+//     let c = sipauth.parse_challenge("Digest realm=\"r\", nonce=\"n\"", false)!
+//     let cr = sipauth.answer(c, "alice", "secret", "REGISTER", "sip:r", "cn", 1)!
+//     println(str.starts_with(sipauth.credentials_value(cr), "Digest username=\"alice\", realm=\"r\""))   // true
+// ```
+pub fn credentials_value(c: SipCredentials) -> Str
+    var out = "Digest username=" + sipstr.quote(c.username) + ", realm=" + sipstr.quote(c.realm)
+        + ", nonce=" + sipstr.quote(c.nonce) + ", uri=" + sipstr.quote(c.uri)
+        + ", response=" + sipstr.quote(c.response) + ", algorithm=" + c.algorithm
+    if c.qop != ""
+        out = out + ", cnonce=" + sipstr.quote(c.cnonce) + ", qop=" + c.qop + ", nc=" + hex8(c.nc)
+    if c.opaque != ""
+        out = out + ", opaque=" + sipstr.quote(c.opaque)
+    out
+
+// Read the value of an Authorization or Proxy-Authorization header, for a
+// server that checks it.
+//
+// ```novo
+// use sipauth
+//
+// fn main() [io]
+//     let c = sipauth.parse_challenge("Digest realm=\"r\", nonce=\"n\", qop=\"auth\"", false)!
+//     let cr = sipauth.answer(c, "alice", "secret", "REGISTER", "sip:r", "cn", 2)!
+//     let back = sipauth.parse_credentials(sipauth.credentials_value(cr))!
+//     println("${back.username} ${back.nc} ${sipauth.check(back, "secret", "REGISTER")}")   // alice 2 true
+// ```
+pub fn parse_credentials(value: Str) -> Result<SipCredentials, SipError>
+    let t = str.trim(value)
+    let sp = str.index(t, " ") ?? -1
+    if sp < 1 or not sipstr.eq_ci(str.slice(t, 0, sp), "Digest")
+        return Err(SipBadAuth(value))
+    let pieces = sipstr.split_top(str.slice(t, sp + 1, str.len(t)), 44)
+    if not has_field(pieces, "username") or not has_field(pieces, "response") or not has_field(pieces, "nonce")
+        return Err(SipBadAuth(value))
+    var algorithm = field(pieces, "algorithm")
+    if algorithm == ""
+        algorithm = "MD5"
+    var nc = 0
+    let ncs = field(pieces, "nc")
+    for i in 0..str.len(ncs)
+        let b = str.byte_at_or(ncs, i, 0)
+        var d = -1
+        if b >= 48 and b <= 57
+            d = b - 48
+        elif b >= 97 and b <= 102
+            d = b - 87
+        elif b >= 65 and b <= 70
+            d = b - 55
+        if d < 0
+            return Err(SipBadAuth(value))
+        nc = nc * 16 + d
+    Ok(SipCredentials { username: field(pieces, "username"), realm: field(pieces, "realm"),
+                        nonce: field(pieces, "nonce"), uri: field(pieces, "uri"),
+                        response: field(pieces, "response"), algorithm: algorithm,
+                        cnonce: field(pieces, "cnonce"), qop: field(pieces, "qop"), nc: nc,
+                        opaque: field(pieces, "opaque") })
+
+// Whether credentials are right for `password` and the `method` of the
+// request: the response is computed again and compared.  The nonce is not
+// checked here, which is the server's to remember; neither is the count.
+//
+// ```novo
+// use sipauth
+//
+// fn main() [io]
+//     let c = sipauth.parse_challenge("Digest realm=\"r\", nonce=\"n\"", false)!
+//     let cr = sipauth.answer(c, "alice", "secret", "INVITE", "sip:r", "cn", 1)!
+//     println("${sipauth.check(cr, "secret", "INVITE")} ${sipauth.check(cr, "wrong", "INVITE")}")   // true false
+// ```
+pub fn check(c: SipCredentials, password: Str, method: Str) -> Bool
+    match digest_response(c.algorithm, c.username, c.realm, password, c.nonce, method, c.uri, c.qop, c.cnonce, c.nc)
+        Err(_) => false
+        Ok(r)  => str.lower(r) == str.lower(c.response)

@@ -1,0 +1,433 @@
+// tests/sipua_tests.nv — the user agent: a registration with a digest
+// challenge, and calls between two agents that are wired to each other in
+// memory, so that every message of RFC 3261 section 13 and section 15 is the
+// real one, formed by one agent and read by the other.
+
+use std.bytes
+use std.str
+use std.test
+use sipauth
+use sipmsg
+use sipua
+use siptxn
+
+fn alice(transport: Str) -> SipUa
+    sipua.ua_new("sip:alice@atlanta.example", "sip:alice@192.0.2.1:5060", "sip:atlanta.example", "192.0.2.1", 5060,
+                 transport, "", "secret", "a")
+
+fn bob(transport: Str) -> SipUa
+    sipua.ua_new("sip:bob@biloxi.example", "sip:bob@192.0.2.4:5060", "sip:biloxi.example", "192.0.2.4", 5060,
+                 transport, "bob", "pw", "b")
+
+// Count the events of a kind.
+fn count(evs: [SipEvent], kind: Int) -> Int
+    var n = 0
+    for e in evs
+        if e.kind == kind
+            n = n + 1
+    n
+
+// Carry the messages of `first`, which agent `a` produced, to `b`, and what
+// `b` answers to `a`, until nothing is left.  The events that are not
+// messages are appended to `seen_a` and `seen_b`.  A message is dropped when
+// `drop` is a method name that it has.
+fn wire(var a: SipUa, var b: SipUa, first: [SipEvent], now: Int, drop: Str, var seen_a: [SipEvent],
+        var seen_b: [SipEvent])
+    var qa: [SipEvent] = first[:]
+    var qb: [SipEvent] = []
+    for _r in 0..40
+        var na: [SipEvent] = []
+        var nb: [SipEvent] = []
+        for e in qa
+            if e.kind == sipua.UA_SEND
+                if sipmsg.parse(e.data)!.method != drop
+                    for x in sipua.ua_receive(var b, e.data, now)
+                        list.push(nb, x)
+            else
+                list.push(seen_a, e)
+        for e in qb
+            if e.kind == sipua.UA_SEND
+                if sipmsg.parse(e.data)!.method != drop
+                    for x in sipua.ua_receive(var a, e.data, now)
+                        list.push(na, x)
+            else
+                list.push(seen_b, e)
+        qa = na
+        qb = nb
+
+fn first_of(evs: [SipEvent], kind: Int) -> SipEvent
+    for e in evs
+        if e.kind == kind
+            return e
+    evs[0]
+
+fn msg(e: SipEvent) -> SipMessage
+    sipmsg.parse(e.data)!
+
+@test
+fn a_new_agent_has_nothing_to_do()
+    let ua = alice("UDP")
+    test.assert_eq(ua.reg_state, sipua.REG_NONE)
+    test.assert_eq(ua.username, "alice")
+    test.assert_eq(ua.reliable, false)
+    test.assert_eq(sipua.ua_next_deadline(ua), -1)
+    let tcp = alice("TCP")
+    test.assert_eq(tcp.reliable, true)
+    let named = sipua.ua_new("not a uri", "sip:x@y", "sip:y", "y", 5060, "UDP", "", "pw", "z")
+    test.assert_eq(named.username, "not a uri")
+
+@test
+fn register_answers_a_challenge_once_and_is_refreshed()
+    var ua = alice("UDP")
+    let evs = sipua.ua_register(var ua, 3600, 1000)
+    test.assert_eq(count(evs, sipua.UA_SEND), 1)
+    let req = msg(evs[0])
+    test.assert_eq(req.method, "REGISTER")
+    test.assert_eq(req.uri, "sip:atlanta.example")
+    test.assert_eq(sipmsg.header_value(req, "Expires") ?? "-", "3600")
+    test.assert_eq(sipmsg.header_value(req, "Contact") ?? "-", "<sip:alice@192.0.2.1:5060>")
+    test.assert_eq(ua.reg_state, sipua.REG_PENDING)
+    test.assert_eq(sipua.ua_next_deadline(ua), 1500)
+    // The registrar challenges.
+    var challenge = sipbuild_response(req, 401)
+    challenge = sipmsg.set_header(challenge, "WWW-Authenticate",
+        "Digest realm=\"atlanta.example\", nonce=\"84f1c1ae6cbe5ua9c\", algorithm=SHA-256, qop=\"auth\"")
+    let again = sipua.ua_receive(var ua, sipmsg.write(challenge), 1100)
+    test.assert_eq(count(again, sipua.UA_SEND), 1)
+    let req2 = msg(again[0])
+    test.assert_eq(sipmsg.header_value(req2, "CSeq") ?? "-", "2 REGISTER")
+    test.assert_eq(sipmsg.call_id(req2), sipmsg.call_id(req))
+    let cr = sipauth.parse_credentials(sipmsg.header_value(req2, "Authorization") ?? "")!
+    test.assert_eq(cr.username, "alice")
+    test.assert_eq(sipauth.check(cr, "secret", "REGISTER"), true)
+    test.assert_eq(sipauth.check(cr, "wrong", "REGISTER"), false)
+    // A second challenge is a failure.
+    let again2 = sipua.ua_receive(var ua, sipmsg.write(sipmsg.set_header(sipbuild_response(req2, 401), "WWW-Authenticate",
+        "Digest realm=\"atlanta.example\", nonce=\"zz\"")), 1200)
+    test.assert_eq(first_of(again2, sipua.UA_REGISTER_FAILED).status, 401)
+    test.assert_eq(ua.reg_state, sipua.REG_FAILED)
+
+@test
+fn a_registration_that_succeeds_is_refreshed_at_four_fifths()
+    var ua = alice("UDP")
+    let evs = sipua.ua_register(var ua, 100, 0)
+    let req = msg(evs[0])
+    let ok = sipmsg.set_header(sipbuild_response(req, 200), "Expires", "50")
+    let got = sipua.ua_receive(var ua, sipmsg.write(ok), 10)
+    let done = first_of(got, sipua.UA_REGISTERED)
+    test.assert_eq(done.text, "50")
+    test.assert_eq(done.status, 200)
+    test.assert_eq(ua.reg_state, sipua.REG_OK)
+    test.assert_eq(ua.reg_at, 10 + 50 * 800)
+    // The transaction's Timer K, T4 after the answer, is the first thing due.
+    test.assert_eq(sipua.ua_next_deadline(ua), 5010)
+    test.assert_eq(count(sipua.ua_tick(var ua, 6000), sipua.UA_SEND), 0)
+    test.assert_eq(sipua.ua_next_deadline(ua), 40010)
+    test.assert_eq(count(sipua.ua_tick(var ua, 40009), sipua.UA_SEND), 0)
+    let refresh = sipua.ua_tick(var ua, 40010)
+    test.assert_eq(count(refresh, sipua.UA_SEND), 1)
+    test.assert_eq(sipmsg.header_value(msg(refresh[0]), "CSeq") ?? "-", "2 REGISTER")
+    // No Expires in the answer: what was asked for.
+    var ub = alice("UDP")
+    let r2 = sipua.ua_register(var ub, 600, 0)
+    let g2 = sipua.ua_receive(var ub, sipmsg.write(sipbuild_response(msg(r2[0]), 200)), 5)
+    test.assert_eq(first_of(g2, sipua.UA_REGISTERED).text, "600")
+    // An unregistration leaves nothing to refresh.
+    var uc = alice("UDP")
+    let r3 = sipua.ua_register(var uc, 0, 0)
+    let g3 = sipua.ua_receive(var uc, sipmsg.write(sipbuild_response(msg(r3[0]), 200)), 5)
+    test.assert_eq(first_of(g3, sipua.UA_REGISTERED).text, "0")
+    test.assert_eq(uc.reg_at, -1)
+
+fn sipbuild_response(req: SipMessage, status: Int) -> SipMessage
+    sipbuild_resp(req, status)
+
+@test
+fn a_registration_can_fail_by_status_or_by_silence()
+    var ua = alice("UDP")
+    let evs = sipua.ua_register(var ua, 3600, 0)
+    let got = sipua.ua_receive(var ua, sipmsg.write(sipbuild_response(msg(evs[0]), 403)), 10)
+    test.assert_eq(first_of(got, sipua.UA_REGISTER_FAILED).status, 403)
+    // A 401 with a challenge nobody can read.
+    var ub = alice("UDP")
+    let e2 = sipua.ua_register(var ub, 3600, 0)
+    let g2 = sipua.ua_receive(var ub, sipmsg.write(sipbuild_response(msg(e2[0]), 401)), 10)
+    test.assert_eq(ub.reg_state, sipua.REG_FAILED)
+    test.assert_eq(count(g2, sipua.UA_SEND), 0)
+    // Silence: Timer F.
+    var uc = alice("UDP")
+    let _ = sipua.ua_register(var uc, 3600, 0)
+    let t = sipua.ua_tick(var uc, 500)
+    test.assert_eq(count(t, sipua.UA_SEND), 1)
+    let end = sipua.ua_tick(var uc, 32000)
+    test.assert_eq(first_of(end, sipua.UA_REGISTER_FAILED).status, 0)
+    test.assert_eq(uc.reg_state, sipua.REG_FAILED)
+    test.assert_eq(list.len(uc.slots), 0)
+    // A provisional answer is ignored.
+    var ud = alice("UDP")
+    let e4 = sipua.ua_register(var ud, 3600, 0)
+    test.assert_eq(list.len(sipua.ua_receive(var ud, sipmsg.write(sipbuild_response(msg(e4[0]), 100)), 5)), 0)
+
+@test
+fn a_call_is_placed_answered_and_hung_up()
+    var a = alice("UDP")
+    var b = bob("UDP")
+    var sa: [SipEvent] = []
+    var sb: [SipEvent] = []
+    wire(var a, var b, sipua.ua_invite(var a, "sip:bob@biloxi.example", "v=0\r\ns=offer\r\n", 0), 0, "-", var sa, var sb)
+    let inc = first_of(sb, sipua.UA_INCOMING)
+    test.assert_eq(inc.text, "sip:alice@atlanta.example")
+    test.assert_eq(inc.body, "v=0\r\ns=offer\r\n")
+    test.assert_eq(inc.call, 0)
+    test.assert_eq(b.calls[0].state, sipua.CALL_INCOMING)
+    test.assert_eq(count(sa, sipua.UA_RINGING), 0)
+    // Ringing, then the answer.
+    var sa2: [SipEvent] = []
+    var sb2: [SipEvent] = []
+    wire(var b, var a, sipua.ua_answer(var b, 0, 180, "", 100), 100, "-", var sb2, var sa2)
+    test.assert_eq(first_of(sa2, sipua.UA_RINGING).status, 180)
+    test.assert_eq(a.calls[0].state, sipua.CALL_RINGING)
+    var sa3: [SipEvent] = []
+    var sb3: [SipEvent] = []
+    wire(var b, var a, sipua.ua_answer(var b, 0, 200, "v=0\r\ns=answer\r\n", 200), 200, "-", var sb3, var sa3)
+    let ans = first_of(sa3, sipua.UA_ANSWERED)
+    test.assert_eq(ans.body, "v=0\r\ns=answer\r\n")
+    test.assert_eq(ans.status, 200)
+    test.assert_eq(a.calls[0].state, sipua.CALL_ESTABLISHED)
+    test.assert_eq(count(sb3, sipua.UA_CALL_ESTABLISHED), 1)
+    test.assert_eq(b.calls[0].state, sipua.CALL_ESTABLISHED)
+    test.assert_eq(a.calls[0].dialog.remote_tag, b.calls[0].local_tag)
+    // Alice hangs up.
+    var sa4: [SipEvent] = []
+    var sb4: [SipEvent] = []
+    wire(var a, var b, sipua.ua_hangup(var a, 0, 1000), 1000, "-", var sa4, var sb4)
+    test.assert_eq(count(sa4, sipua.UA_CALL_ENDED), 1)
+    test.assert_eq(count(sb4, sipua.UA_CALL_ENDED), 1)
+    test.assert_eq(a.calls[0].state, sipua.CALL_ENDED)
+    test.assert_eq(b.calls[0].state, sipua.CALL_ENDED)
+    // Nothing is left but timers that run out.
+    let late = sipua.ua_tick(var a, 100000)
+    test.assert_eq(list.len(late), 0)
+    test.assert_eq(list.len(a.slots), 0)
+
+@test
+fn a_call_can_be_refused_and_the_refusal_is_acknowledged()
+    var a = alice("UDP")
+    var b = bob("UDP")
+    var sa: [SipEvent] = []
+    var sb: [SipEvent] = []
+    wire(var a, var b, sipua.ua_invite(var a, "sip:bob@biloxi.example", "", 0), 0, "-", var sa, var sb)
+    var sa2: [SipEvent] = []
+    var sb2: [SipEvent] = []
+    wire(var b, var a, sipua.ua_answer(var b, 0, 486, "", 10), 10, "-", var sb2, var sa2)
+    test.assert_eq(first_of(sa2, sipua.UA_CALL_FAILED).status, 486)
+    test.assert_eq(count(sb2, sipua.UA_CALL_ENDED), 1)
+    test.assert_eq(a.calls[0].state, sipua.CALL_ENDED)
+    // Bob's transaction took the ACK; both end after their timers.
+    let _ = sipua.ua_tick(var b, 40000)
+    let _ = sipua.ua_tick(var a, 40000)
+    test.assert_eq(list.len(b.slots), 0)
+    test.assert_eq(list.len(a.slots), 0)
+    // Answering a call that is not waiting, or does not exist, does nothing.
+    test.assert_eq(list.len(sipua.ua_answer(var b, 0, 200, "", 50)), 0)
+    test.assert_eq(list.len(sipua.ua_answer(var b, 7, 200, "", 50)), 0)
+    test.assert_eq(list.len(sipua.ua_answer(var b, -1, 200, "", 50)), 0)
+    test.assert_eq(list.len(sipua.ua_hangup(var b, 9, 50)), 0)
+
+@test
+fn an_unanswered_incoming_call_is_declined_by_hanging_up()
+    var a = alice("UDP")
+    var b = bob("UDP")
+    var sa: [SipEvent] = []
+    var sb: [SipEvent] = []
+    wire(var a, var b, sipua.ua_invite(var a, "sip:bob@biloxi.example", "", 0), 0, "-", var sa, var sb)
+    var sa2: [SipEvent] = []
+    var sb2: [SipEvent] = []
+    wire(var b, var a, sipua.ua_hangup(var b, 0, 10), 10, "-", var sb2, var sa2)
+    test.assert_eq(first_of(sa2, sipua.UA_CALL_FAILED).status, 603)
+
+@test
+fn a_call_is_cancelled_while_it_rings()
+    var a = alice("UDP")
+    var b = bob("UDP")
+    var sa: [SipEvent] = []
+    var sb: [SipEvent] = []
+    wire(var a, var b, sipua.ua_invite(var a, "sip:bob@biloxi.example", "", 0), 0, "-", var sa, var sb)
+    var sa2: [SipEvent] = []
+    var sb2: [SipEvent] = []
+    wire(var b, var a, sipua.ua_answer(var b, 0, 180, "", 5), 5, "-", var sb2, var sa2)
+    var sa3: [SipEvent] = []
+    var sb3: [SipEvent] = []
+    wire(var a, var b, sipua.ua_hangup(var a, 0, 20), 20, "-", var sa3, var sb3)
+    test.assert_eq(first_of(sa3, sipua.UA_CALL_FAILED).status, 487)
+    test.assert_eq(first_of(sb3, sipua.UA_CALL_ENDED).status, 487)
+    test.assert_eq(b.calls[0].state, sipua.CALL_ENDED)
+    test.assert_eq(a.calls[0].state, sipua.CALL_ENDED)
+    // A CANCEL for a call that is not there is answered 481.
+    let stray = sipbuild_cancel("nonexistent-call")
+    let got = sipua.ua_receive(var b, sipmsg.write(stray), 30)
+    test.assert_eq(sipmsg.parse(got[0].data)!.status, 481)
+
+@test
+fn the_answer_is_repeated_until_the_ack_comes_and_the_ack_is_repeated_with_it()
+    var a = alice("UDP")
+    var b = bob("UDP")
+    var sa: [SipEvent] = []
+    var sb: [SipEvent] = []
+    wire(var a, var b, sipua.ua_invite(var a, "sip:bob@biloxi.example", "", 0), 0, "-", var sa, var sb)
+    // The ACK is lost.
+    var sa2: [SipEvent] = []
+    var sb2: [SipEvent] = []
+    wire(var b, var a, sipua.ua_answer(var b, 0, 200, "", 100), 100, "ACK", var sb2, var sa2)
+    test.assert_eq(b.calls[0].state, sipua.CALL_ANSWERED)
+    test.assert_eq(a.calls[0].state, sipua.CALL_ESTABLISHED)
+    test.assert_eq(sipua.ua_next_deadline(b) >= 0, true)
+    test.assert_eq(count(sipua.ua_tick(var b, 599), sipua.UA_SEND), 0)
+    let again = sipua.ua_tick(var b, 600)
+    test.assert_eq(count(again, sipua.UA_SEND), 1)
+    test.assert_eq(msg(again[0]).status, 200)
+    // Alice sees the 2xx again and sends the ACK again; this time it arrives.
+    var sa3: [SipEvent] = []
+    var sb3: [SipEvent] = []
+    wire(var b, var a, again, 600, "-", var sb3, var sa3)
+    test.assert_eq(count(sb3, sipua.UA_CALL_ESTABLISHED), 1)
+    test.assert_eq(b.calls[0].state, sipua.CALL_ESTABLISHED)
+    // A 2xx for a call that is not established is not answered.
+    test.assert_eq(list.len(sipua.ua_tick(var b, 2000)), 0)
+
+@test
+fn an_answer_that_is_never_acknowledged_fails_after_64_t1()
+    var a = alice("UDP")
+    var b = bob("UDP")
+    var sa: [SipEvent] = []
+    var sb: [SipEvent] = []
+    wire(var a, var b, sipua.ua_invite(var a, "sip:bob@biloxi.example", "", 0), 0, "-", var sa, var sb)
+    var sa2: [SipEvent] = []
+    var sb2: [SipEvent] = []
+    wire(var b, var a, sipua.ua_answer(var b, 0, 200, "", 0), 0, "ACK", var sb2, var sa2)
+    var sent = 0
+    var failed = 0
+    for k in 1..80
+        let evs = sipua.ua_tick(var b, k * 500)
+        sent = sent + count(evs, sipua.UA_SEND)
+        failed = failed + count(evs, sipua.UA_CALL_FAILED)
+    test.assert_eq(failed, 1)
+    test.assert_eq(sent > 5, true)
+    test.assert_eq(b.calls[0].state, sipua.CALL_ENDED)
+
+@test
+fn an_invite_that_nobody_answers_times_out()
+    var a = alice("UDP")
+    let evs = sipua.ua_invite(var a, "sip:bob@biloxi.example", "", 0)
+    test.assert_eq(count(evs, sipua.UA_SEND), 1)
+    test.assert_eq(count(sipua.ua_tick(var a, 500), sipua.UA_SEND), 1)
+    test.assert_eq(count(sipua.ua_tick(var a, 1500), sipua.UA_SEND), 1)
+    test.assert_eq(count(sipua.ua_tick(var a, 3500), sipua.UA_SEND), 1)
+    let end = sipua.ua_tick(var a, 32000)
+    test.assert_eq(first_of(end, sipua.UA_CALL_FAILED).status, 0)
+    test.assert_eq(a.calls[0].state, sipua.CALL_ENDED)
+
+@test
+fn an_invite_is_answered_with_credentials_once()
+    var a = alice("UDP")
+    let evs = sipua.ua_invite(var a, "sip:bob@biloxi.example", "v=0\r\n", 0)
+    let inv = msg(evs[0])
+    let challenge = sipmsg.set_header(sipbuild_response(inv, 407), "Proxy-Authenticate",
+        "Digest realm=\"biloxi.example\", nonce=\"abc\"")
+    let got = sipua.ua_receive(var a, sipmsg.write(challenge), 10)
+    // The ACK for the 407 and the new INVITE.
+    test.assert_eq(count(got, sipua.UA_SEND), 2)
+    test.assert_eq(msg(got[0]).method, "ACK")
+    let inv2 = msg(got[1])
+    test.assert_eq(inv2.method, "INVITE")
+    test.assert_eq(sipmsg.header_value(inv2, "CSeq") ?? "-", "2 INVITE")
+    test.assert_eq(sipmsg.has_header(inv2, "Proxy-Authorization"), true)
+    test.assert_eq(sipmsg.body_text(inv2), "v=0\r\n")
+    // Another 407 ends the call.
+    let again = sipmsg.set_header(sipbuild_response(inv2, 407), "Proxy-Authenticate", "Digest realm=\"biloxi.example\", nonce=\"abd\"")
+    let end = sipua.ua_receive(var a, sipmsg.write(again), 20)
+    test.assert_eq(first_of(end, sipua.UA_CALL_FAILED).status, 407)
+    // A challenge nobody can read ends it at once.
+    var b = alice("UDP")
+    let e2 = sipua.ua_invite(var b, "sip:bob@biloxi.example", "", 0)
+    let g2 = sipua.ua_receive(var b, sipmsg.write(sipbuild_response(msg(e2[0]), 401)), 10)
+    test.assert_eq(b.calls[0].state, sipua.CALL_ENDED)
+    test.assert_eq(count(g2, sipua.UA_SEND), 1)
+
+@test
+fn calls_over_a_reliable_transport_end_at_once()
+    var a = alice("TCP")
+    var b = bob("TCP")
+    var sa: [SipEvent] = []
+    var sb: [SipEvent] = []
+    wire(var a, var b, sipua.ua_invite(var a, "sip:bob@biloxi.example", "", 0), 0, "-", var sa, var sb)
+    var sa2: [SipEvent] = []
+    var sb2: [SipEvent] = []
+    wire(var b, var a, sipua.ua_answer(var b, 0, 200, "", 5), 5, "-", var sb2, var sa2)
+    test.assert_eq(a.calls[0].state, sipua.CALL_ESTABLISHED)
+    test.assert_eq(b.calls[0].state, sipua.CALL_ESTABLISHED)
+    test.assert_eq(b.calls[0].retx_at, -1)
+    var sa3: [SipEvent] = []
+    var sb3: [SipEvent] = []
+    wire(var b, var a, sipua.ua_hangup(var b, 0, 50), 50, "-", var sb3, var sa3)
+    test.assert_eq(count(sa3, sipua.UA_CALL_ENDED), 1)
+    let _ = sipua.ua_tick(var a, 51)
+    let _ = sipua.ua_tick(var b, 51)
+    test.assert_eq(list.len(a.slots), 0)
+    // Bob's INVITE transaction stays in Accepted for Timer L, 64 T1 from the 2xx.
+    test.assert_eq(list.len(b.slots), 1)
+    test.assert_eq(b.slots[0].txn.state, siptxn.TXN_ACCEPTED)
+    let _ = sipua.ua_tick(var b, 5 + 32000)
+    test.assert_eq(list.len(b.slots), 0)
+
+@test
+fn requests_the_agent_does_not_serve_are_refused()
+    var b = bob("UDP")
+    let opts = sipbuild_request("OPTIONS", "sip:bob@biloxi.example", "c1", "")
+    let got = sipua.ua_receive(var b, sipmsg.write(opts), 0)
+    test.assert_eq(sipmsg.parse(got[0].data)!.status, 200)
+    test.assert_eq(list.len(sipmsg.header_values(sipmsg.parse(got[0].data)!, "Allow")), 5)
+    let sub = sipbuild_request("SUBSCRIBE", "sip:bob@biloxi.example", "c2", "")
+    test.assert_eq(sipmsg.parse(sipua.ua_receive(var b, sipmsg.write(sub), 0)[0].data)!.status, 405)
+    let bye = sipbuild_request("BYE", "sip:bob@biloxi.example", "c3", "t")
+    test.assert_eq(sipmsg.parse(sipua.ua_receive(var b, sipmsg.write(bye), 0)[0].data)!.status, 481)
+    // An INVITE inside a dialog, and one with no Contact.
+    let re = sipbuild_request("INVITE", "sip:bob@biloxi.example", "c4", "remote")
+    test.assert_eq(sipmsg.parse(sipua.ua_receive(var b, sipmsg.write(re), 0)[0].data)!.status, 481)
+    let nocontact = sipmsg.remove_header(sipbuild_request("INVITE", "sip:bob@biloxi.example", "c5", ""), "Contact")
+    test.assert_eq(sipmsg.parse(sipua.ua_receive(var b, sipmsg.write(nocontact), 0)[0].data)!.status, 400)
+    let notto = sipmsg.remove_header(sipbuild_request("INVITE", "sip:bob@biloxi.example", "c6", ""), "To")
+    test.assert_eq(sipmsg.parse(sipua.ua_receive(var b, sipmsg.write(notto), 0)[0].data)!.status, 400)
+    // A retransmission of the OPTIONS gets its answer again, and a stray ACK nothing.
+    test.assert_eq(count(sipua.ua_receive(var b, sipmsg.write(opts), 1), sipua.UA_SEND), 1)
+    let ack = sipbuild_request("ACK", "sip:bob@biloxi.example", "nocall", "")
+    test.assert_eq(list.len(sipua.ua_receive(var b, sipmsg.write(ack), 2)), 0)
+    // A response nobody waits for is dropped, and a repeated 2xx for an unknown call too.
+    let stray = sipbuild_resp(opts, 200)
+    test.assert_eq(list.len(sipua.ua_receive(var b, sipmsg.write(sipmsg.set_header(stray, "CSeq", "9 INVITE")), 3)), 0)
+    test.assert_eq(list.len(sipua.ua_receive(var b, bytes.from_str("not sip\r\n\r\n"), 3)), 0)
+
+fn sipbuild_resp(req: SipMessage, status: Int) -> SipMessage
+    sipmsg.response(status, sipmsg.reason_of(status), [
+        sipmsg.header_of("Via", sipmsg.header_value(req, "Via") ?? ""),
+        sipmsg.header_of("To", sipmsg.header_value(req, "To") ?? ""),
+        sipmsg.header_of("From", sipmsg.header_value(req, "From") ?? ""),
+        sipmsg.header_of("Call-ID", sipmsg.call_id(req)),
+        sipmsg.header_of("CSeq", sipmsg.header_value(req, "CSeq") ?? "")], bytes.from_str(""))
+
+// A request from a remote party, with a branch that is its own.
+fn sipbuild_request(method: Str, uri: Str, call_id: Str, to_tag: Str) -> SipMessage
+    var to = "<sip:bob@biloxi.example>"
+    if str.len(to_tag) > 0
+        to = to + ";tag=" + to_tag
+    sipmsg.request(method, uri, [
+        sipmsg.header_of("Via", "SIP/2.0/UDP 198.51.100.7:5060;branch=z9hG4bKr-" + call_id),
+        sipmsg.header_of("Max-Forwards", "70"),
+        sipmsg.header_of("To", to),
+        sipmsg.header_of("From", "<sip:carol@chicago.example>;tag=ct"),
+        sipmsg.header_of("Call-ID", call_id),
+        sipmsg.header_of("CSeq", "1 " + method),
+        sipmsg.header_of("Contact", "<sip:carol@198.51.100.7:5060>")], bytes.from_str(""))
+
+fn sipbuild_cancel(call_id: Str) -> SipMessage
+    sipbuild_request("CANCEL", "sip:bob@biloxi.example", call_id, "")

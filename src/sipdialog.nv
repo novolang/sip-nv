@@ -1,0 +1,281 @@
+// sipdialog.nv — dialogs, RFC 3261 section 12.
+//
+// A dialog is the peer-to-peer relationship that an INVITE and its answers
+// make.  Its identity is the Call-ID, the local tag and the remote tag.  What
+// it keeps is what the next request in it needs: the CSeq numbers of both
+// ends, the remote target (the peer's Contact) and the route set, which is the
+// Record-Route headers of the exchange.  The client (UAC) takes the route set
+// in reverse order from the response; the server (UAS) takes it in order from
+// the request (sections 12.1.1 and 12.1.2).
+//
+// A request in the dialog (section 12.2.1.1) goes to the remote target, or to
+// the first element of the route set when that element has the `lr` parameter
+// (loose routing) and the Route headers are the whole set.  If the first
+// element has no `lr` (strict routing) the request goes to it, the Route
+// headers are the rest of the set, and the remote target is the last of
+// them.  The CSeq is the local number plus one; the ACK of a 2xx uses the
+// number of the INVITE and does not advance it.
+
+use std.bytes
+use std.str
+use siperr
+use sipbuild
+use sipmsg
+use sipstr
+use sipuri
+
+// The dialog was made by a provisional response (an early dialog).
+pub const DIALOG_EARLY = 0
+// The dialog was made by a 2xx.
+pub const DIALOG_CONFIRMED = 1
+// A BYE ended it.
+pub const DIALOG_TERMINATED = 2
+
+// A dialog.
+pub struct SipDialog
+    call_id: Str
+    local_tag: Str
+    remote_tag: Str
+    // The CSeq number of the last request this end sent, or -1 for none.
+    var local_seq: Int
+    // The CSeq number of the last request the peer sent, or -1 for none.
+    var remote_seq: Int
+    // The URI of the local party (the From of this end's requests).
+    local_uri: Str
+    // The URI of the remote party.
+    remote_uri: Str
+    // The peer's Contact URI.
+    remote_target: Str
+    // The Record-Route values, in the order requests from this end use.
+    route_set: [Str]
+    // Whether this end made the first request.
+    is_uac: Bool
+    // One of the `DIALOG_` values.
+    var state: Int
+
+// The URI of an address header value, without brackets.
+fn uri_text(value: Str) -> Result<Str, SipError>
+    let a = sipuri.parse_addr(value)!
+    Ok(sipuri.write(a.uri))
+
+// The values of the Record-Route headers of `m`, in the order written.
+fn record_routes(m: SipMessage) -> [Str]
+    sipmsg.header_values(m, "Record-Route")
+
+// The dialog a UAC makes from its request and a response with a To tag
+// (section 12.1.2).  A 1xx makes an early dialog and a 2xx a confirmed one.
+// Answers `SipNoHeader` for a response with no Contact, From, To or tag.
+//
+// ```novo
+// use sipbuild
+// use sipdialog
+// use sipmsg
+//
+// fn main() [io]
+//     let via = sipmsg.new_via("UDP", "h", -1, sipbuild.new_branch("1"))
+//     let inv = sipbuild.new_request("INVITE", "sip:bob@b", "<sip:bob@b>", "<sip:alice@a>;tag=aa", "cid", 1, via, "<sip:alice@h>", 70, [])
+//     let ok = sipmsg.set_header(sipbuild.new_response(inv, 200, "", "bb"), "Contact", "<sip:bob@192.0.2.4>")
+//     let d = sipdialog.from_response(inv, ok)!
+//     println("${d.local_tag} ${d.remote_tag} ${d.remote_target} ${d.state}")   // aa bb sip:bob@192.0.2.4 1
+// ```
+pub fn from_response(req: SipMessage, resp: SipMessage) -> Result<SipDialog, SipError>
+    let from = sipmsg.from_addr(req)!
+    let to = sipmsg.to_addr(resp)!
+    let seq = sipmsg.cseq(req)!
+    let contact = sipmsg.header_value(resp, "Contact")
+    match contact
+        None    => return Err(SipNoHeader("Contact"))
+        Some(c) =>
+            let target = uri_text(c)!
+            if str.len(sipuri.addr_tag(to)) == 0
+                return Err(SipNoHeader("To tag"))
+            var routes: [Str] = []
+            for r in record_routes(resp)
+                routes = list.concat([r], routes)
+            var state = DIALOG_EARLY
+            if resp.status >= 200
+                state = DIALOG_CONFIRMED
+            Ok(SipDialog { call_id: sipmsg.call_id(resp), local_tag: sipuri.addr_tag(from),
+                           remote_tag: sipuri.addr_tag(to), local_seq: seq.seq, remote_seq: -1,
+                           local_uri: sipuri.write(from.uri), remote_uri: sipuri.write(to.uri),
+                           remote_target: target, route_set: routes, is_uac: true, state: state })
+
+// The dialog a UAS makes from the request it received and the tag it will put
+// in its responses (section 12.1.1).  Answers `SipNoHeader` for a request with
+// no Contact or no From tag.
+//
+// ```novo
+// use sipbuild
+// use sipdialog
+// use sipmsg
+//
+// fn main() [io]
+//     let via = sipmsg.new_via("UDP", "h", -1, sipbuild.new_branch("1"))
+//     let inv = sipbuild.new_request("INVITE", "sip:bob@b", "<sip:bob@b>", "<sip:alice@a>;tag=aa", "cid", 1, via, "<sip:alice@h>", 70, [])
+//     let d = sipdialog.from_request(inv, "bb", false)!
+//     println("${d.local_tag} ${d.remote_tag} ${d.remote_seq} ${d.is_uac}")   // bb aa 1 false
+// ```
+pub fn from_request(req: SipMessage, local_tag: Str, confirmed: Bool) -> Result<SipDialog, SipError>
+    let from = sipmsg.from_addr(req)!
+    let to = sipmsg.to_addr(req)!
+    let seq = sipmsg.cseq(req)!
+    match sipmsg.header_value(req, "Contact")
+        None    => Err(SipNoHeader("Contact"))
+        Some(c) =>
+            let target = uri_text(c)!
+            if str.len(sipuri.addr_tag(from)) == 0
+                return Err(SipNoHeader("From tag"))
+            var state = DIALOG_EARLY
+            if confirmed
+                state = DIALOG_CONFIRMED
+            Ok(SipDialog { call_id: sipmsg.call_id(req), local_tag: local_tag, remote_tag: sipuri.addr_tag(from),
+                           local_seq: -1, remote_seq: seq.seq, local_uri: sipuri.write(to.uri),
+                           remote_uri: sipuri.write(from.uri), remote_target: target,
+                           route_set: record_routes(req), is_uac: false, state: state })
+
+// Whether a request received belongs to the dialog: the Call-ID agrees, the
+// From tag is the remote tag and the To tag is the local tag.
+//
+// ```novo
+// use sipbuild
+// use sipdialog
+// use sipmsg
+//
+// fn main() [io]
+//     let via = sipmsg.new_via("UDP", "h", -1, sipbuild.new_branch("1"))
+//     let inv = sipbuild.new_request("INVITE", "sip:bob@b", "<sip:bob@b>", "<sip:alice@a>;tag=aa", "cid", 1, via, "<sip:alice@h>", 70, [])
+//     let d = sipdialog.from_request(inv, "bb", true)!
+//     let bye = sipbuild.new_request("BYE", "sip:bob@b", "<sip:bob@b>;tag=bb", "<sip:alice@a>;tag=aa", "cid", 2, via, "", 70, [])
+//     println("${sipdialog.matches_request(d, bye)} ${sipdialog.matches_request(d, inv)}")   // true false
+// ```
+pub fn matches_request(d: SipDialog, req: SipMessage) -> Bool
+    if sipmsg.call_id(req) != d.call_id
+        return false
+    match sipmsg.from_addr(req)
+        Err(_) => return false
+        Ok(f)  =>
+            match sipmsg.to_addr(req)
+                Err(_) => return false
+                Ok(t)  => return sipuri.addr_tag(f) == d.remote_tag and sipuri.addr_tag(t) == d.local_tag
+
+// Whether a response received belongs to the dialog: the Call-ID agrees, the
+// From tag is the local tag and the To tag is the remote tag.
+//
+// ```novo
+// use sipbuild
+// use sipdialog
+// use sipmsg
+//
+// fn main() [io]
+//     let via = sipmsg.new_via("UDP", "h", -1, sipbuild.new_branch("1"))
+//     let inv = sipbuild.new_request("INVITE", "sip:bob@b", "<sip:bob@b>", "<sip:alice@a>;tag=aa", "cid", 1, via, "<sip:alice@h>", 70, [])
+//     let ok = sipmsg.set_header(sipbuild.new_response(inv, 200, "", "bb"), "Contact", "<sip:bob@192.0.2.4>")
+//     let d = sipdialog.from_response(inv, ok)!
+//     println("${sipdialog.matches_response(d, ok)}")   // true
+// ```
+pub fn matches_response(d: SipDialog, resp: SipMessage) -> Bool
+    if sipmsg.call_id(resp) != d.call_id
+        return false
+    match sipmsg.from_addr(resp)
+        Err(_) => return false
+        Ok(f)  =>
+            match sipmsg.to_addr(resp)
+                Err(_) => return false
+                Ok(t)  => return sipuri.addr_tag(f) == d.local_tag and sipuri.addr_tag(t) == d.remote_tag
+
+// Check the CSeq of a request received in the dialog (section 12.2.2): it must be
+// above the last one, otherwise the answer is 500.  Answers true and records the
+// number, or false.  The first request fixes the number when none was known.
+//
+// ```novo
+// use sipbuild
+// use sipdialog
+// use sipmsg
+//
+// fn main() [io]
+//     let via = sipmsg.new_via("UDP", "h", -1, sipbuild.new_branch("1"))
+//     let inv = sipbuild.new_request("INVITE", "sip:bob@b", "<sip:bob@b>", "<sip:alice@a>;tag=aa", "cid", 1, via, "<sip:alice@h>", 70, [])
+//     var d = sipdialog.from_request(inv, "bb", true)!
+//     let bye = sipbuild.new_request("BYE", "sip:bob@b", "<sip:bob@b>;tag=bb", "<sip:alice@a>;tag=aa", "cid", 2, via, "", 70, [])
+//     println("${sipdialog.accept_cseq(var d, bye)} ${sipdialog.accept_cseq(var d, bye)}")   // true false
+// ```
+pub fn accept_cseq(var d: SipDialog, req: SipMessage) -> Bool
+    match sipmsg.cseq(req)
+        Err(_) => false
+        Ok(c)  =>
+            if d.remote_seq >= 0 and c.seq <= d.remote_seq
+                return false
+            d.remote_seq = c.seq
+            true
+
+// The Request-URI and Route values for a request in the dialog, as section
+// 12.2.1.1 gives them.  The first element is the Request-URI, the rest are the
+// Route values in order.
+fn targets(d: SipDialog) -> [Str]
+    if list.len(d.route_set) == 0
+        return [d.remote_target]
+    let first = sipuri.parse_addr(d.route_set[0])
+    match first
+        Err(_) => [d.remote_target]
+        Ok(f)  =>
+            if sipuri.has_param(f.uri.params, "lr")
+                return list.concat([d.remote_target], d.route_set)
+            // Strict routing: the request goes to the first element and the
+            // remote target is the last Route.
+            var out: [Str] = [sipuri.write(f.uri)]
+            for i in 1..list.len(d.route_set)
+                list.push(out, d.route_set[i])
+            list.push(out, "<" + d.remote_target + ">")
+            out
+
+// A request in the dialog: the local CSeq advances by one (the first request
+// of a dialog made by a UAS starts at 1) and the To and From carry the tags.
+// `via` and `contact` are the caller's, as in `new_request`.
+//
+// ```novo
+// use sipbuild
+// use sipdialog
+// use sipmsg
+//
+// fn main() [io]
+//     let via = sipmsg.new_via("UDP", "h", -1, sipbuild.new_branch("1"))
+//     let inv = sipbuild.new_request("INVITE", "sip:bob@b", "<sip:bob@b>", "<sip:alice@a>;tag=aa", "cid", 1, via, "<sip:alice@h>", 70, [])
+//     let ok = sipmsg.set_header(sipbuild.new_response(inv, 200, "", "bb"), "Contact", "<sip:bob@192.0.2.4>")
+//     var d = sipdialog.from_response(inv, ok)!
+//     let bye = sipdialog.request(var d, "BYE", sipmsg.new_via("UDP", "h", -1, sipbuild.new_branch("2")), "")
+//     println("${bye.uri} ${sipmsg.header_value(bye, "CSeq") ?? "-"}")   // sip:bob@192.0.2.4 2 BYE
+// ```
+pub fn request(var d: SipDialog, method: Str, via: SipVia, contact: Str) -> SipMessage
+    d.local_seq = d.local_seq + 1
+    if d.local_seq < 1
+        d.local_seq = 1
+    formed(d, method, d.local_seq, via, contact)
+
+// The ACK of a 2xx to the INVITE whose CSeq number is `invite_seq`
+// (section 13.2.2.4): a request in the dialog with that number.  The local CSeq
+// does not advance.
+//
+// ```novo
+// use sipbuild
+// use sipdialog
+// use sipmsg
+//
+// fn main() [io]
+//     let via = sipmsg.new_via("UDP", "h", -1, sipbuild.new_branch("1"))
+//     let inv = sipbuild.new_request("INVITE", "sip:bob@b", "<sip:bob@b>", "<sip:alice@a>;tag=aa", "cid", 1, via, "<sip:alice@h>", 70, [])
+//     let ok = sipmsg.set_header(sipbuild.new_response(inv, 200, "", "bb"), "Contact", "<sip:bob@192.0.2.4>")
+//     let d = sipdialog.from_response(inv, ok)!
+//     let ack = sipdialog.ack_for_2xx(d, 1, sipmsg.new_via("UDP", "h", -1, sipbuild.new_branch("3")))
+//     println(sipmsg.header_value(ack, "CSeq") ?? "-")   // 1 ACK
+// ```
+pub fn ack_for_2xx(d: SipDialog, invite_seq: Int, via: SipVia) -> SipMessage
+    formed(d, "ACK", invite_seq, via, "")
+
+// A request of this dialog with the CSeq number given.
+fn formed(d: SipDialog, method: Str, seq: Int, via: SipVia, contact: Str) -> SipMessage
+    let t = targets(d)
+    var routes: [Str] = []
+    for i in 1..list.len(t)
+        list.push(routes, t[i])
+    sipbuild.new_request(method, t[0], "<" + d.remote_uri + ">;tag=" + d.remote_tag,
+                         "<" + d.local_uri + ">;tag=" + d.local_tag, d.call_id, seq, via, contact, 70, routes)

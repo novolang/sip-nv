@@ -1,0 +1,648 @@
+// sipua.nv — a SIP user agent as a step a caller drives: register, place a
+// call, answer a call, hang up.
+//
+// The agent has no socket and no clock.  The caller gives it the octets of each
+// datagram or framed message that arrives (`ua_receive`) and the time (`ua_tick`),
+// and sends the octets of every `UA_SEND` event to its outbound proxy or
+// registrar, which is a single peer here.  The commands (`ua_register`,
+// `ua_invite`, `ua_answer`, `ua_hangup`) answer events in the same way.  Every
+// time is a number of milliseconds on the caller's clock, and `ua_next_deadline`
+// says when `ua_tick` has to be called.  Randomness arrives as a `seed` the
+// caller chooses once: tags, branches and Call-IDs are made from it and a
+// counter, so a seed that two agents share makes two agents that clash.
+//
+// WHAT IS INSIDE.  Each request or response goes through a transaction of
+// `siptxn`.  A call has a dialog of `sipdialog`.  The ACK of a 2xx is sent by
+// the agent itself, with the dialog's route set, and sent again whenever the
+// 2xx is repeated; the 2xx of an incoming call is repeated with the intervals
+// of section 13.3.1.4, from T1 up to T2, until the ACK comes or 64*T1 have gone.
+// A 401 or 407 to a REGISTER or an INVITE is answered once with the digest
+// credentials of `sipauth`.
+//
+// WHAT IS NOT.  Re-INVITE and UPDATE, PRACK and 100rel, SUBSCRIBE and NOTIFY,
+// forking (a second dialog from the same INVITE is ignored), a transport
+// other than the one given, and redirection: a 3xx is reported as a failure.
+
+use std.bytes
+use std.str
+use sipauth
+use sipbuild
+use sipdialog
+use sipmsg
+use siptxn
+use siperr
+use sipstr
+use sipuri
+
+// The agent has nothing to say.
+pub const UA_NONE = 0
+// Send `data` to the peer.
+pub const UA_SEND = 1
+// The registration succeeded; `status` is 200 and `text` the seconds granted.
+pub const UA_REGISTERED = 2
+// The registration failed with `status`, or 0 for a timeout.
+pub const UA_REGISTER_FAILED = 3
+// A call came in: `call` is its number, `text` the caller's URI, `body` its offer.
+pub const UA_INCOMING = 4
+// An outgoing call is ringing (`status` 180) or in progress (183).
+pub const UA_RINGING = 5
+// An outgoing call was answered; `body` is the answer.
+pub const UA_ANSWERED = 6
+// A call failed with `status`, or 0 for a timeout.
+pub const UA_CALL_FAILED = 7
+// A call ended.
+pub const UA_CALL_ENDED = 8
+// An incoming call is established: the ACK came.
+pub const UA_CALL_ESTABLISHED = 9
+
+// An outgoing call, INVITE sent.
+pub const CALL_INVITING = 0
+// An outgoing call, a provisional response received.
+pub const CALL_RINGING = 1
+// An incoming call not yet answered.
+pub const CALL_INCOMING = 2
+// An incoming call answered with a 2xx; the ACK is awaited.
+pub const CALL_ANSWERED = 3
+// A call in progress.
+pub const CALL_ESTABLISHED = 4
+// A call that has ended or failed.
+pub const CALL_ENDED = 5
+
+// Not registered.
+pub const REG_NONE = 0
+// A REGISTER is in flight.
+pub const REG_PENDING = 1
+// Registered.
+pub const REG_OK = 2
+// The last REGISTER failed.
+pub const REG_FAILED = 3
+
+// What the agent reports.
+pub struct SipEvent
+    // A `UA_` value.
+    kind: Int
+    // The call number, or -1.
+    call: Int
+    // A status code, or 0.
+    status: Int
+    // The octets to send, for `UA_SEND`.
+    data: Bytes
+    // The remote party or the seconds granted.
+    text: Str
+    // A session description.
+    body: Str
+
+// A call.
+pub struct SipCall
+    id: Int
+    var state: Int
+    is_uac: Bool
+    // The INVITE this end sent or received.
+    var invite: SipMessage
+    var dialog: SipDialog
+    var has_dialog: Bool
+    var remote_sdp: Str
+    // The ACK of a 2xx, kept to send again.
+    var ack: SipMessage
+    // The 2xx of an incoming call, kept to send again.
+    var answer: SipMessage
+    var retx_at: Int
+    var retx_interval: Int
+    var give_up_at: Int
+    var auth_tried: Bool
+    var peer: Str
+    local_tag: Str
+
+// A transaction and who it belongs to.
+pub struct SipSlot
+    txn: SipTxn
+    // The `ROLE_` value.
+    role: Int
+    call: Int
+
+// A REGISTER transaction.
+pub const ROLE_REGISTER = 0
+// An outgoing INVITE.
+pub const ROLE_INVITE_OUT = 1
+// An incoming INVITE.
+pub const ROLE_INVITE_IN = 2
+// An outgoing BYE.
+pub const ROLE_BYE_OUT = 3
+// An outgoing CANCEL.
+pub const ROLE_CANCEL_OUT = 5
+// Any other request received.
+pub const ROLE_OTHER_IN = 7
+
+// A user agent.
+pub struct SipUa
+    aor: Str
+    contact: Str
+    registrar: Str
+    host: Str
+    port: Int
+    transport: Str
+    reliable: Bool
+    username: Str
+    password: Str
+    seed: Str
+    var counter: Int
+    var reg_state: Int
+    var reg_call_id: Str
+    var reg_cseq: Int
+    var reg_expires: Int
+    var reg_at: Int
+    var reg_request: SipMessage
+    var reg_auth_tried: Bool
+    var slots: [SipSlot]
+    var calls: [SipCall]
+
+// An agent for the address of record `aor` (`sip:alice@atlanta.example`),
+// reachable at `contact` (`sip:alice@192.0.2.1:5060`).  `host` and `port` go in
+// the Via of its requests; `transport` is UDP, TCP or TLS; `registrar` is the
+// Request-URI of a REGISTER.  `username` and `password` answer a challenge; an
+// empty `username` is the user part of `aor`.
+//
+// ```novo
+// use sipua
+//
+// fn main() [io]
+//     let ua = sipua.ua_new("sip:alice@atlanta.example", "sip:alice@192.0.2.1:5060", "sip:atlanta.example", "192.0.2.1", 5060, "UDP", "", "secret", "s1")
+//     println("${ua.reg_state} ${ua.username}")   // 0 alice
+// ```
+pub fn ua_new(aor: Str, contact: Str, registrar: Str, host: Str, port: Int, transport: Str, username: Str,
+              password: Str, seed: Str) -> SipUa
+    var user = username
+    if str.len(user) == 0
+        match sipuri.parse(aor)
+            Err(_) => user = aor
+            Ok(u)  => user = u.user
+    SipUa { aor: aor, contact: contact, registrar: registrar, host: host, port: port, transport: transport,
+            reliable: transport != "UDP", username: user, password: password, seed: seed, counter: 0,
+            reg_state: REG_NONE, reg_call_id: "", reg_cseq: 0, reg_expires: 0, reg_at: -1,
+            reg_request: sipmsg.request("REGISTER", registrar, [], bytes.from_str("")), reg_auth_tried: false,
+            slots: [], calls: [] }
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+fn event(kind: Int, call: Int, status: Int, data: Bytes, text: Str, body: Str) -> SipEvent
+    SipEvent { kind: kind, call: call, status: status, data: data, text: text, body: body }
+
+fn send_event(m: SipMessage, call: Int) -> SipEvent
+    event(UA_SEND, call, 0, sipmsg.write(m), "", "")
+
+fn token(var ua: SipUa) -> Str
+    ua.counter = ua.counter + 1
+    ua.seed + str.from_int(ua.counter)
+
+fn fresh_via(var ua: SipUa) -> SipVia
+    sipmsg.new_via(ua.transport, ua.host, ua.port, sipbuild.new_branch(token(var ua)))
+
+// The index of the call whose INVITE has the Call-ID, or -1.
+fn call_by_id(ua: SipUa, call_id: Str) -> Int
+    for i in 0..list.len(ua.calls)
+        if sipmsg.call_id(ua.calls[i].invite) == call_id
+            return i
+    -1
+
+// Send a request through a new client transaction.
+fn begin_client(var ua: SipUa, req: SipMessage, role: Int, call: Int, now: Int) -> [SipEvent]
+    var t = siptxn.client_new(req, ua.reliable)
+    let acts = siptxn.start(var t, now)
+    list.push(ua.slots, SipSlot { txn: t, role: role, call: call })
+    var evs: [SipEvent] = []
+    run(var ua, list.len(ua.slots) - 1, acts, now, var evs)
+    evs
+
+// Carry out the actions a transaction asked for.
+fn run(var ua: SipUa, slot: Int, acts: [SipAction], now: Int, var evs: [SipEvent])
+    for a in acts
+        if a.kind == siptxn.ACT_SEND
+            list.push(evs, send_event(a.message, ua.slots[slot].call))
+        elif a.kind == siptxn.ACT_DELIVER
+            deliver(var ua, slot, a.message, now, var evs)
+        elif a.kind == siptxn.ACT_TIMEOUT
+            timed_out(var ua, slot, var evs)
+
+// A transaction ran out of time.
+fn timed_out(var ua: SipUa, slot: Int, var evs: [SipEvent])
+    let role = ua.slots[slot].role
+    let call = ua.slots[slot].call
+    if role == ROLE_REGISTER
+        ua.reg_state = REG_FAILED
+        list.push(evs, event(UA_REGISTER_FAILED, -1, 0, bytes.from_str(""), "", ""))
+    elif role == ROLE_INVITE_OUT
+        var c = ua.calls[call]
+        c.state = CALL_ENDED
+        list.push(evs, event(UA_CALL_FAILED, call, 0, bytes.from_str(""), "", ""))
+
+// The request `orig` again, with a new Via and CSeq and the credentials that
+// answer the challenge in `resp` (a 401 or a 407).
+fn retried(var ua: SipUa, orig: SipMessage, resp: SipMessage) -> Result<SipMessage, SipError>
+    var header = "WWW-Authenticate"
+    var answer_to = "Authorization"
+    if resp.status == 407
+        header = "Proxy-Authenticate"
+        answer_to = "Proxy-Authorization"
+    let value = sipmsg.header_value(resp, header)
+    match value
+        None    => Err(SipNoHeader(header))
+        Some(v) =>
+            let ch = sipauth.parse_challenge(v, resp.status == 407)!
+            let seq = sipmsg.cseq(orig)!
+            let cr = sipauth.answer(ch, ua.username, ua.password, orig.method, orig.uri, token(var ua), 1)!
+            let a = sipmsg.set_header(orig, "CSeq", str.from_int(seq.seq + 1) + " " + orig.method)
+            let b = sipmsg.set_header(a, "Via", sipmsg.write_via(fresh_via(var ua)))
+            Ok(sipmsg.set_header(b, answer_to, sipauth.credentials_value(cr)))
+
+// A response reached the transaction user of a client transaction.
+fn deliver(var ua: SipUa, slot: Int, resp: SipMessage, now: Int, var evs: [SipEvent])
+    let role = ua.slots[slot].role
+    let call = ua.slots[slot].call
+    if role == ROLE_REGISTER
+        if resp.status < 200
+            return
+        if resp.status == 200
+            ua.reg_state = REG_OK
+            var granted = ua.reg_expires
+            let h = sipmsg.header_value(resp, "Expires")
+            match h
+                None    => granted = ua.reg_expires
+                Some(x) =>
+                    if sipstr.number(x) >= 0
+                        granted = sipstr.number(x)
+            if granted > 0
+                ua.reg_at = now + granted * 800
+            else
+                ua.reg_at = -1
+            list.push(evs, event(UA_REGISTERED, -1, 200, bytes.from_str(""), str.from_int(granted), ""))
+            return
+        if (resp.status == 401 or resp.status == 407) and not ua.reg_auth_tried
+            match retried(var ua, ua.reg_request, resp)
+                Err(_) => ua.reg_state = REG_FAILED
+                Ok(r)  =>
+                    ua.reg_auth_tried = true
+                    ua.reg_request = r
+                    for e in begin_client(var ua, r, ROLE_REGISTER, -1, now)
+                        list.push(evs, e)
+                    return
+        ua.reg_state = REG_FAILED
+        list.push(evs, event(UA_REGISTER_FAILED, -1, resp.status, bytes.from_str(""), "", ""))
+        return
+    if role != ROLE_INVITE_OUT
+        return
+    var c = ua.calls[call]
+    if resp.status < 200
+        if resp.status > 100
+            c.state = CALL_RINGING
+            list.push(evs, event(UA_RINGING, call, resp.status, bytes.from_str(""), "", ""))
+        return
+    if resp.status < 300
+        if c.has_dialog
+            return
+        match sipdialog.from_response(c.invite, resp)
+            Err(_) =>
+                c.state = CALL_ENDED
+                list.push(evs, event(UA_CALL_FAILED, call, resp.status, bytes.from_str(""), "", ""))
+            Ok(d)  =>
+                c.dialog = d
+                c.has_dialog = true
+                c.state = CALL_ESTABLISHED
+                c.remote_sdp = sipmsg.body_text(resp)
+                let inv = sipmsg.cseq(c.invite)!
+                c.ack = sipdialog.ack_for_2xx(d, inv.seq, fresh_via(var ua))
+                list.push(evs, send_event(c.ack, call))
+                list.push(evs, event(UA_ANSWERED, call, resp.status, bytes.from_str(""), c.peer, c.remote_sdp))
+        return
+    if (resp.status == 401 or resp.status == 407) and not c.auth_tried
+        match retried(var ua, c.invite, resp)
+            Err(_) => c.state = CALL_ENDED
+            Ok(r)  =>
+                c.auth_tried = true
+                c.invite = r
+                for e in begin_client(var ua, r, ROLE_INVITE_OUT, call, now)
+                    list.push(evs, e)
+                return
+    c.state = CALL_ENDED
+    list.push(evs, event(UA_CALL_FAILED, call, resp.status, bytes.from_str(""), "", ""))
+
+// ── Commands ──────────────────────────────────────────────────────────────
+
+// Register the contact for `expires` seconds.  A 401 or 407 is answered once
+// with the credentials; the registration is refreshed at four fifths of the
+// time granted, when `ua_tick` is called after `reg_at`.
+//
+// ```novo
+// use sipua
+//
+// fn main() [io]
+//     var ua = sipua.ua_new("sip:alice@atlanta.example", "sip:alice@192.0.2.1:5060", "sip:atlanta.example", "192.0.2.1", 5060, "UDP", "", "secret", "s1")
+//     let evs = sipua.ua_register(var ua, 3600, 0)
+//     println("${list.len(evs)} ${evs[0].kind} ${ua.reg_state}")   // 1 1 1
+// ```
+pub fn ua_register(var ua: SipUa, expires: Int, now: Int) -> [SipEvent]
+    if str.len(ua.reg_call_id) == 0
+        ua.reg_call_id = token(var ua) + "@" + ua.host
+    ua.reg_cseq = ua.reg_cseq + 1
+    ua.reg_expires = expires
+    ua.reg_auth_tried = false
+    ua.reg_state = REG_PENDING
+    ua.reg_at = -1
+    let me = "<" + ua.aor + ">"
+    let base = sipbuild.new_request("REGISTER", ua.registrar, me, sipbuild.with_tag(me, "r" + ua.seed), ua.reg_call_id,
+                                    ua.reg_cseq, fresh_via(var ua), "<" + ua.contact + ">", 70, [])
+    let req = sipmsg.set_header(base, "Expires", str.from_int(expires))
+    ua.reg_request = req
+    begin_client(var ua, req, ROLE_REGISTER, -1, now)
+
+// Place a call to `target` (a URI) offering the session description `sdp`
+// (text, "" for none).  The call's number is `list.len(ua.calls) - 1` after the
+// call; every event about it carries that number.
+//
+// ```novo
+// use sipua
+//
+// fn main() [io]
+//     var ua = sipua.ua_new("sip:alice@atlanta.example", "sip:alice@192.0.2.1:5060", "sip:atlanta.example", "192.0.2.1", 5060, "UDP", "", "secret", "s1")
+//     let evs = sipua.ua_invite(var ua, "sip:bob@biloxi.example", "v=0\r\n", 0)
+//     println("${evs[0].call} ${list.len(ua.calls)} ${ua.calls[0].state}")   // 0 1 0
+// ```
+pub fn ua_invite(var ua: SipUa, target: Str, sdp: Str, now: Int) -> [SipEvent]
+    let id = list.len(ua.calls)
+    let tag = token(var ua)
+    let call_id = token(var ua) + "@" + ua.host
+    let base = sipbuild.new_request("INVITE", target, "<" + target + ">", "<" + ua.aor + ">;tag=" + tag, call_id, 1,
+                                    fresh_via(var ua), "<" + ua.contact + ">", 70, [])
+    var req = base
+    if str.len(sdp) > 0
+        req = sipmsg.with_body(base, "application/sdp", bytes.from_str(sdp))
+    let nobody = sipmsg.request("INVITE", target, [], bytes.from_str(""))
+    let d = sipdialog.SipDialog { call_id: call_id, local_tag: tag, remote_tag: "", local_seq: 1, remote_seq: -1,
+                                  local_uri: ua.aor, remote_uri: target, remote_target: target, route_set: [],
+                                  is_uac: true, state: sipdialog.DIALOG_EARLY }
+    list.push(ua.calls, SipCall { id: id, state: CALL_INVITING, is_uac: true, invite: req, dialog: d, has_dialog: false,
+                                  remote_sdp: "", ack: nobody, answer: nobody, retx_at: -1, retx_interval: 0,
+                                  give_up_at: -1, auth_tried: false, peer: target, local_tag: tag })
+    begin_client(var ua, req, ROLE_INVITE_OUT, id, now)
+
+// The index of the server transaction for the INVITE of an incoming call, or -1.
+fn invite_slot(ua: SipUa, call: Int) -> Int
+    for i in 0..list.len(ua.slots)
+        if ua.slots[i].role == ROLE_INVITE_IN and ua.slots[i].call == call
+            return i
+    -1
+
+// Answer an incoming call with `status`: 180 or 183 to say it is ringing, 200
+// to accept it with the session description `sdp`, or a final status of 300 or
+// more to refuse it.  A 2xx is repeated until the ACK comes.
+//
+// ```novo
+// use sipua
+//
+// fn main() [io]
+//     var ua = sipua.ua_new("sip:bob@biloxi.example", "sip:bob@192.0.2.4:5060", "sip:biloxi.example", "192.0.2.4", 5060, "UDP", "", "pw", "b1")
+//     println("${list.len(sipua.ua_answer(var ua, 0, 200, "", 0))}")   // 0
+// ```
+pub fn ua_answer(var ua: SipUa, call: Int, status: Int, sdp: Str, now: Int) -> [SipEvent]
+    var evs: [SipEvent] = []
+    if call < 0 or call >= list.len(ua.calls)
+        return evs
+    var c = ua.calls[call]
+    let si = invite_slot(ua, call)
+    if c.state != CALL_INCOMING or si < 0
+        return evs
+    var resp = sipbuild.new_response(c.invite, status, "", c.local_tag)
+    if status >= 200 and status < 300
+        resp = sipmsg.set_header(resp, "Contact", "<" + ua.contact + ">")
+        if str.len(sdp) > 0
+            resp = sipmsg.with_body(resp, "application/sdp", bytes.from_str(sdp))
+    var t = ua.slots[si].txn
+    let acts = siptxn.send_response(var t, resp, now)
+    run(var ua, si, acts, now, var evs)
+    if status >= 200 and status < 300
+        c.state = CALL_ANSWERED
+        c.answer = resp
+        c.dialog.state = sipdialog.DIALOG_CONFIRMED
+        c.retx_interval = siptxn.SIP_T1
+        if not ua.reliable
+            c.retx_at = now + siptxn.SIP_T1
+        c.give_up_at = now + 64 * siptxn.SIP_T1
+    elif status >= 300
+        c.state = CALL_ENDED
+        list.push(evs, event(UA_CALL_ENDED, call, status, bytes.from_str(""), "", ""))
+    evs
+
+// End a call: a BYE for an established one, a CANCEL for one still being set
+// up, a 603 for an incoming one not yet answered.
+//
+// ```novo
+// use sipua
+//
+// fn main() [io]
+//     var ua = sipua.ua_new("sip:alice@atlanta.example", "sip:alice@192.0.2.1:5060", "sip:atlanta.example", "192.0.2.1", 5060, "UDP", "", "secret", "s1")
+//     let _ = sipua.ua_invite(var ua, "sip:bob@biloxi.example", "", 0)
+//     let evs = sipua.ua_hangup(var ua, 0, 10)
+//     println("${list.len(evs)}")   // 1
+// ```
+pub fn ua_hangup(var ua: SipUa, call: Int, now: Int) -> [SipEvent]
+    var evs: [SipEvent] = []
+    if call < 0 or call >= list.len(ua.calls)
+        return evs
+    var c = ua.calls[call]
+    if c.state == CALL_INVITING or c.state == CALL_RINGING
+        for e in begin_client(var ua, sipbuild.cancel_for(c.invite), ROLE_CANCEL_OUT, call, now)
+            list.push(evs, e)
+        return evs
+    if c.state == CALL_INCOMING
+        return ua_answer(var ua, call, 603, "", now)
+    if c.state == CALL_ESTABLISHED or c.state == CALL_ANSWERED
+        var d = c.dialog
+        let bye = sipdialog.request(var d, "BYE", fresh_via(var ua), "")
+        c.state = CALL_ENDED
+        c.retx_at = -1
+        for e in begin_client(var ua, bye, ROLE_BYE_OUT, call, now)
+            list.push(evs, e)
+        list.push(evs, event(UA_CALL_ENDED, call, 0, bytes.from_str(""), "", ""))
+    evs
+
+// ── Receiving ─────────────────────────────────────────────────────────────
+
+// A response from the stateless side of the agent, for a request it will not
+// carry on with.
+fn stateless(req: SipMessage, status: Int) -> SipEvent
+    send_event(sipbuild.new_response(req, status, "", "x"), -1)
+
+// A new request, outside any transaction the agent has.
+fn new_request(var ua: SipUa, req: SipMessage, now: Int) -> [SipEvent]
+    var evs: [SipEvent] = []
+    if req.method == "INVITE"
+        let to = sipmsg.to_addr(req)
+        match to
+            Err(_) =>
+                list.push(evs, stateless(req, 400))
+                return evs
+            Ok(t)  =>
+                if str.len(sipuri.addr_tag(t)) > 0
+                    list.push(evs, stateless(req, 481))
+                    return evs
+        let tag = token(var ua)
+        match sipdialog.from_request(req, tag, false)
+            Err(_) => list.push(evs, stateless(req, 400))
+            Ok(d)  =>
+                let id = list.len(ua.calls)
+                let nobody = sipmsg.request("INVITE", req.uri, [], bytes.from_str(""))
+                let from = sipmsg.from_addr(req)!
+                list.push(ua.calls, SipCall { id: id, state: CALL_INCOMING, is_uac: false, invite: req, dialog: d,
+                                              has_dialog: true, remote_sdp: sipmsg.body_text(req), ack: nobody,
+                                              answer: nobody, retx_at: -1, retx_interval: 0, give_up_at: -1,
+                                              auth_tried: false, peer: sipuri.write(from.uri), local_tag: tag })
+                var t = siptxn.server_new(req, ua.reliable)
+                list.push(ua.slots, SipSlot { txn: t, role: ROLE_INVITE_IN, call: id })
+                let si = list.len(ua.slots) - 1
+                let trying = sipbuild.new_response(req, 100, "", "")
+                run(var ua, si, siptxn.send_response(var t, trying, now), now, var evs)
+                list.push(evs, event(UA_INCOMING, id, 0, bytes.from_str(""), sipuri.write(from.uri), sipmsg.body_text(req)))
+        return evs
+    if req.method == "BYE"
+        let ci = call_by_id(ua, sipmsg.call_id(req))
+        if ci < 0
+            list.push(evs, stateless(req, 481))
+            return evs
+        var c = ua.calls[ci]
+        var t = siptxn.server_new(req, ua.reliable)
+        list.push(ua.slots, SipSlot { txn: t, role: ROLE_OTHER_IN, call: ci })
+        let ok = sipbuild.new_response(req, 200, "", "")
+        run(var ua, list.len(ua.slots) - 1, siptxn.send_response(var t, ok, now), now, var evs)
+        if c.state != CALL_ENDED
+            c.state = CALL_ENDED
+            c.retx_at = -1
+            list.push(evs, event(UA_CALL_ENDED, ci, 0, bytes.from_str(""), "", ""))
+        return evs
+    if req.method == "CANCEL"
+        let ci = call_by_id(ua, sipmsg.call_id(req))
+        var t = siptxn.server_new(req, ua.reliable)
+        list.push(ua.slots, SipSlot { txn: t, role: ROLE_OTHER_IN, call: ci })
+        let si = list.len(ua.slots) - 1
+        var status = 481
+        if ci >= 0 and ua.calls[ci].state == CALL_INCOMING
+            status = 200
+        run(var ua, si, siptxn.send_response(var t, sipbuild.new_response(req, status, "", ""), now), now, var evs)
+        if status == 200
+            let ii = invite_slot(ua, ci)
+            var it = ua.slots[ii].txn
+            let gone = sipbuild.new_response(ua.calls[ci].invite, 487, "", ua.calls[ci].local_tag)
+            run(var ua, ii, siptxn.send_response(var it, gone, now), now, var evs)
+            var c = ua.calls[ci]
+            c.state = CALL_ENDED
+            list.push(evs, event(UA_CALL_ENDED, ci, 487, bytes.from_str(""), "", ""))
+        return evs
+    var t = siptxn.server_new(req, ua.reliable)
+    list.push(ua.slots, SipSlot { txn: t, role: ROLE_OTHER_IN, call: -1 })
+    var answer = sipbuild.new_response(req, 405, "", "")
+    if req.method == "OPTIONS"
+        answer = sipbuild.new_response(req, 200, "", "")
+    answer = sipmsg.set_header(answer, "Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS")
+    run(var ua, list.len(ua.slots) - 1, siptxn.send_response(var t, answer, now), now, var evs)
+    evs
+
+// Give the agent the octets of one message that arrived, at the time `now`.
+// A message that cannot be read is dropped.
+//
+// ```novo
+// use sipua
+//
+// fn main() [io]
+//     var ua = sipua.ua_new("sip:alice@atlanta.example", "sip:alice@192.0.2.1:5060", "sip:atlanta.example", "192.0.2.1", 5060, "UDP", "", "secret", "s1")
+//     println("${list.len(sipua.ua_receive(var ua, bytes.from_str("garbage"), 0))}")   // 0
+// ```
+pub fn ua_receive(var ua: SipUa, data: Bytes, now: Int) -> [SipEvent]
+    var evs: [SipEvent] = []
+    match sipmsg.parse(data)
+        Err(_) => return evs
+        Ok(m)  =>
+            if not m.is_request
+                for i in 0..list.len(ua.slots)
+                    if siptxn.matches_response(ua.slots[i].txn, m) and ua.slots[i].txn.state != siptxn.TXN_TERMINATED
+                        var t = ua.slots[i].txn
+                        run(var ua, i, siptxn.on_response(var t, m, now), now, var evs)
+                        return evs
+                // A 2xx repeated after its transaction ended: the ACK again.
+                let ci = call_by_id(ua, sipmsg.call_id(m))
+                if ci >= 0 and m.status >= 200 and m.status < 300 and ua.calls[ci].state == CALL_ESTABLISHED
+                    list.push(evs, send_event(ua.calls[ci].ack, ci))
+                return evs
+            for i in 0..list.len(ua.slots)
+                if siptxn.matches_request(ua.slots[i].txn, m) and ua.slots[i].txn.state != siptxn.TXN_TERMINATED
+                    var t = ua.slots[i].txn
+                    run(var ua, i, siptxn.on_request(var t, m, now), now, var evs)
+                    return evs
+            if m.method == "ACK"
+                let ci = call_by_id(ua, sipmsg.call_id(m))
+                if ci >= 0 and ua.calls[ci].state == CALL_ANSWERED
+                    var c = ua.calls[ci]
+                    c.state = CALL_ESTABLISHED
+                    c.retx_at = -1
+                    list.push(evs, event(UA_CALL_ESTABLISHED, ci, 0, bytes.from_str(""), "", ""))
+                return evs
+            return new_request(var ua, m, now)
+
+// The time `now` has come: run the timers of the transactions, repeat the 2xx
+// of an incoming call, and refresh the registration when it is due.
+//
+// ```novo
+// use sipua
+//
+// fn main() [io]
+//     var ua = sipua.ua_new("sip:alice@atlanta.example", "sip:alice@192.0.2.1:5060", "sip:atlanta.example", "192.0.2.1", 5060, "UDP", "", "secret", "s1")
+//     let _ = sipua.ua_register(var ua, 3600, 0)
+//     println("${list.len(sipua.ua_tick(var ua, 500))}")   // 1
+// ```
+pub fn ua_tick(var ua: SipUa, now: Int) -> [SipEvent]
+    var evs: [SipEvent] = []
+    for i in 0..list.len(ua.slots)
+        var t = ua.slots[i].txn
+        run(var ua, i, siptxn.tick(var t, now), now, var evs)
+    var live: [SipSlot] = []
+    for s in ua.slots
+        if s.txn.state != siptxn.TXN_TERMINATED
+            list.push(live, s)
+    ua.slots = live
+    for ci in 0..list.len(ua.calls)
+        var c = ua.calls[ci]
+        if c.state == CALL_ANSWERED
+            if c.give_up_at >= 0 and now >= c.give_up_at
+                c.state = CALL_ENDED
+                c.retx_at = -1
+                list.push(evs, event(UA_CALL_FAILED, ci, 0, bytes.from_str(""), "", ""))
+            elif c.retx_at >= 0 and now >= c.retx_at
+                list.push(evs, send_event(c.answer, ci))
+                c.retx_interval = c.retx_interval * 2
+                if c.retx_interval > siptxn.SIP_T2
+                    c.retx_interval = siptxn.SIP_T2
+                c.retx_at = now + c.retx_interval
+    if ua.reg_state == REG_OK and ua.reg_at >= 0 and now >= ua.reg_at
+        for e in ua_register(var ua, ua.reg_expires, now)
+            list.push(evs, e)
+    evs
+
+// The earliest time at which `ua_tick` has something to do, or -1.
+//
+// ```novo
+// use sipua
+//
+// fn main() [io]
+//     var ua = sipua.ua_new("sip:alice@atlanta.example", "sip:alice@192.0.2.1:5060", "sip:atlanta.example", "192.0.2.1", 5060, "UDP", "", "secret", "s1")
+//     let _ = sipua.ua_register(var ua, 3600, 1000)
+//     println("${sipua.ua_next_deadline(ua)}")   // 1500
+// ```
+pub fn ua_next_deadline(ua: SipUa) -> Int
+    var best = -1
+    for s in ua.slots
+        let d = siptxn.next_deadline(s.txn)
+        if d >= 0 and (best < 0 or d < best)
+            best = d
+    for c in ua.calls
+        if c.state == CALL_ANSWERED and c.retx_at >= 0 and (best < 0 or c.retx_at < best)
+            best = c.retx_at
+    if ua.reg_state == REG_OK and ua.reg_at >= 0 and (best < 0 or ua.reg_at < best)
+        best = ua.reg_at
+    best
